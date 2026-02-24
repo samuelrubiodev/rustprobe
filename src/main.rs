@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -104,18 +104,29 @@ async fn run() -> Result<()> {
 
     let ports = parse_ports(&cli.ports)?;
     let timing = parse_timing(&cli.timing)?;
+    let colors_enabled = supports_color();
+    let show_closed_in_live = cli.ports.trim() != "-";
 
     println!(
-        "Iniciando escaneo: {} objetivo(s), {} puerto(s), concurrencia={}...",
+        "{}: {} objetivo(s), {} puerto(s), concurrencia={}...",
+        paint("Iniciando escaneo", "1;36", colors_enabled),
         targets.len(),
         ports.len(),
         timing.concurrency
     );
 
-    let open_ports = scan_targets(&targets, &ports, timing).await;
+    let open_ports = scan_targets(
+        &targets,
+        &ports,
+        timing,
+        colors_enabled,
+        show_closed_in_live,
+    )
+    .await;
 
     println!(
-        "\nEscaneo finalizado: {} puerto(s) abierto(s) detectado(s).",
+        "\n{}: {} puerto(s) abierto(s) detectado(s).",
+        paint("Escaneo finalizado", "1;36", colors_enabled),
         open_ports.len()
     );
 
@@ -295,7 +306,13 @@ async fn resolve_targets(target: &str) -> Result<Vec<IpAddr>> {
     Ok(resolved.into_iter().collect())
 }
 
-async fn scan_targets(targets: &[IpAddr], ports: &[u16], timing: TimingProfile) -> Vec<OpenPort> {
+async fn scan_targets(
+    targets: &[IpAddr],
+    ports: &[u16],
+    timing: TimingProfile,
+    colors_enabled: bool,
+    show_closed_in_live: bool,
+) -> Vec<OpenPort> {
     let semaphore = Arc::new(Semaphore::new(timing.concurrency));
     let mut tasks = FuturesUnordered::new();
     let scan_started_at = Instant::now();
@@ -309,7 +326,7 @@ async fn scan_targets(targets: &[IpAddr], ports: &[u16], timing: TimingProfile) 
             tasks.push(tokio::spawn(async move {
                 let permit = match semaphore.acquire_owned().await {
                     Ok(permit) => permit,
-                    Err(_) => return None,
+                    Err(_) => return (ip, port, false),
                 };
 
                 let addr = SocketAddr::new(ip, port);
@@ -322,35 +339,59 @@ async fn scan_targets(targets: &[IpAddr], ports: &[u16], timing: TimingProfile) 
                 drop(permit);
 
                 match result {
-                    Ok(Ok(_stream)) => Some(OpenPort { ip, port }),
-                    _ => None,
+                    Ok(Ok(_stream)) => (ip, port, true),
+                    _ => (ip, port, false),
                 }
             }));
         }
     }
 
-    println!("\n#  Tiempo    Host                 Puerto Estado");
-    println!("-- --------- -------------------- ------ ------");
+    println!(
+        "\n{}",
+        paint("#  Tiempo    Host                 Puerto Estado", "1;37", colors_enabled)
+    );
+    println!("{}", paint("-- --------- -------------------- ------ ------", "2;37", colors_enabled));
 
     let mut open_ports = Vec::new();
     let mut found_count: usize = 0;
+    let mut closed_count: usize = 0;
 
     while let Some(joined) = tasks.next().await {
-        if let Ok(Some(open)) = joined {
-            found_count += 1;
+        if let Ok((ip, port, is_open)) = joined {
             let elapsed = format_elapsed(scan_started_at.elapsed());
-            println!(
-                "{:>2} {:>9} {:<20} {:>6} open",
-                found_count, elapsed, open.ip, open.port
-            );
-            open_ports.push(open);
+
+            if is_open {
+                found_count += 1;
+                let open_label = paint("open", "1;32", colors_enabled);
+                println!(
+                    "{:>2} {:>9} {:<20} {:>6} {}",
+                    found_count, elapsed, ip, port, open_label
+                );
+                open_ports.push(OpenPort { ip, port });
+            } else {
+                closed_count += 1;
+                if show_closed_in_live {
+                    let closed_label = paint("closed", "1;31", colors_enabled);
+                    println!(
+                        "{:>2} {:>9} {:<20} {:>6} {}",
+                        found_count + closed_count,
+                        elapsed,
+                        ip,
+                        port,
+                        closed_label
+                    );
+                }
+            }
         }
     }
 
-    println!("-- --------- -------------------- ------ ------");
+    println!("{}", paint("-- --------- -------------------- ------ ------", "2;37", colors_enabled));
     println!(
-        "Resumen: {} abierto(s) de {} comprobaciones.",
-        found_count, total_checks
+        "{}: {} abierto(s), {} cerrado(s), {} comprobaciones.",
+        paint("Resumen", "1;33", colors_enabled),
+        found_count,
+        closed_count,
+        total_checks
     );
 
     open_ports.sort_by_key(|item| (item.ip, item.port));
@@ -362,6 +403,18 @@ fn format_elapsed(duration: Duration) -> String {
     let seconds = total_millis / 1_000;
     let millis = total_millis % 1_000;
     format!("{seconds:>2}.{millis:03}s")
+}
+
+fn supports_color() -> bool {
+    std::io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+}
+
+fn paint(text: &str, ansi_code: &str, enabled: bool) -> String {
+    if enabled {
+        format!("\x1b[{ansi_code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
 }
 
 impl WasmEngine {
