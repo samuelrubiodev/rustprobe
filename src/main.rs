@@ -2,20 +2,21 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use tokio::net::{lookup_host, TcpStream};
+use tokio::net::{lookup_host, TcpStream as TokioTcpStream};
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Duration};
-use wasmtime::{Engine, Linker, Module, Store};
+use tokio::time::{timeout, Duration as TokioDuration};
+use wasmtime::{Caller, Engine, Linker, Module, Store};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -298,7 +299,11 @@ async fn scan_targets(targets: &[IpAddr], ports: &[u16], timing: TimingProfile) 
                 };
 
                 let addr = SocketAddr::new(ip, port);
-                let result = timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await;
+                let result = timeout(
+                    TokioDuration::from_millis(timeout_ms),
+                    TokioTcpStream::connect(addr),
+                )
+                .await;
 
                 drop(permit);
 
@@ -367,7 +372,161 @@ impl WasmEngine {
         let input_bytes = serde_json::to_vec(&input)?;
 
         let mut store = Store::new(&self.engine, ());
-        let linker = Linker::new(&self.engine);
+        let mut linker = Linker::new(&self.engine);
+        linker.func_wrap(
+            "env",
+            "host_send_tcp",
+            |mut caller: Caller<'_, ()>,
+             ip_ptr: i32,
+             ip_len: i32,
+             port: i32,
+             payload_ptr: i32,
+             payload_len: i32|
+             -> i64 {
+                let pack = |ptr: i32, len: i32| -> i64 {
+                    (((ptr as u32 as u64) << 32) | (len as u32 as u64)) as i64
+                };
+
+                if ip_ptr <= 0 || ip_len <= 0 || payload_ptr <= 0 || payload_len <= 0 {
+                    return 0;
+                }
+
+                let Some(memory) = caller.get_export("memory").and_then(|item| item.into_memory())
+                else {
+                    return 0;
+                };
+
+                let Ok(ip_offset) = usize::try_from(ip_ptr) else {
+                    return 0;
+                };
+                let Ok(ip_size) = usize::try_from(ip_len) else {
+                    return 0;
+                };
+                let Ok(payload_offset) = usize::try_from(payload_ptr) else {
+                    return 0;
+                };
+                let Ok(payload_size) = usize::try_from(payload_len) else {
+                    return 0;
+                };
+
+                let memory_size = memory.data_size(&caller);
+
+                let ip_end = match ip_offset.checked_add(ip_size) {
+                    Some(end) if end <= memory_size => end,
+                    _ => return 0,
+                };
+
+                let payload_end = match payload_offset.checked_add(payload_size) {
+                    Some(end) if end <= memory_size => end,
+                    _ => return 0,
+                };
+
+                if ip_end == ip_offset || payload_end == payload_offset {
+                    return 0;
+                }
+
+                let mut ip_bytes = vec![0u8; ip_size];
+                if memory.read(&caller, ip_offset, &mut ip_bytes).is_err() {
+                    return 0;
+                }
+
+                let mut payload = vec![0u8; payload_size];
+                if memory.read(&caller, payload_offset, &mut payload).is_err() {
+                    return 0;
+                }
+
+                let ip_text = match std::str::from_utf8(&ip_bytes) {
+                    Ok(text) => text,
+                    Err(_) => return 0,
+                };
+
+                let ip_addr = match ip_text.parse::<IpAddr>() {
+                    Ok(addr) => addr,
+                    Err(_) => return 0,
+                };
+
+                let port_u16 = match u16::try_from(port) {
+                    Ok(value) if value > 0 => value,
+                    _ => return 0,
+                };
+
+                let socket = SocketAddr::new(ip_addr, port_u16);
+                let mut stream = match TcpStream::connect_timeout(&socket, Duration::from_secs(2)) {
+                    Ok(stream) => stream,
+                    Err(_) => return 0,
+                };
+
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+                if stream.write_all(&payload).is_err() {
+                    return 0;
+                }
+
+                let mut response = Vec::new();
+                let mut temp = [0u8; 4096];
+
+                loop {
+                    match stream.read(&mut temp) {
+                        Ok(0) => break,
+                        Ok(n) => response.extend_from_slice(&temp[..n]),
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::TimedOut
+                                || err.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            break;
+                        }
+                        Err(_) => return 0,
+                    }
+                }
+
+                if response.is_empty() {
+                    return 0;
+                }
+
+                let out_len = match i32::try_from(response.len()) {
+                    Ok(len) => len,
+                    Err(_) => return 0,
+                };
+
+                let Some(alloc_func) = caller.get_export("alloc").and_then(|item| item.into_func())
+                else {
+                    return 0;
+                };
+
+                let alloc = match alloc_func.typed::<i32, i32>(&caller) {
+                    Ok(func) => func,
+                    Err(_) => return 0,
+                };
+
+                let out_ptr = match alloc.call(&mut caller, out_len) {
+                    Ok(ptr) if ptr > 0 => ptr,
+                    _ => return 0,
+                };
+
+                let Ok(out_offset) = usize::try_from(out_ptr) else {
+                    return 0;
+                };
+                let Ok(out_size) = usize::try_from(out_len) else {
+                    return 0;
+                };
+
+                let write_end = match out_offset.checked_add(out_size) {
+                    Some(end) if end <= memory.data_size(&caller) => end,
+                    _ => return 0,
+                };
+
+                if write_end == out_offset {
+                    return 0;
+                }
+
+                if memory.write(&mut caller, out_offset, &response).is_err() {
+                    return 0;
+                }
+
+                pack(out_ptr, out_len)
+            },
+        )?;
         let instance = linker
             .instantiate(&mut store, module)
             .context("No se pudo instanciar el módulo Wasm")?;
