@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -105,7 +105,19 @@ async fn run() -> Result<()> {
     let ports = parse_ports(&cli.ports)?;
     let timing = parse_timing(&cli.timing)?;
 
+    println!(
+        "Iniciando escaneo: {} objetivo(s), {} puerto(s), concurrencia={}...",
+        targets.len(),
+        ports.len(),
+        timing.concurrency
+    );
+
     let open_ports = scan_targets(&targets, &ports, timing).await;
+
+    println!(
+        "\nEscaneo finalizado: {} puerto(s) abierto(s) detectado(s).",
+        open_ports.len()
+    );
 
     let wasm_engine = match &cli.script {
         Some(script_path) if !open_ports.is_empty() => Some(WasmEngine::load(script_path)?),
@@ -286,6 +298,8 @@ async fn resolve_targets(target: &str) -> Result<Vec<IpAddr>> {
 async fn scan_targets(targets: &[IpAddr], ports: &[u16], timing: TimingProfile) -> Vec<OpenPort> {
     let semaphore = Arc::new(Semaphore::new(timing.concurrency));
     let mut tasks = FuturesUnordered::new();
+    let scan_started_at = Instant::now();
+    let total_checks = targets.len().saturating_mul(ports.len());
 
     for &ip in targets {
         for &port in ports {
@@ -315,15 +329,39 @@ async fn scan_targets(targets: &[IpAddr], ports: &[u16], timing: TimingProfile) 
         }
     }
 
+    println!("\n#  Tiempo    Host                 Puerto Estado");
+    println!("-- --------- -------------------- ------ ------");
+
     let mut open_ports = Vec::new();
+    let mut found_count: usize = 0;
+
     while let Some(joined) = tasks.next().await {
         if let Ok(Some(open)) = joined {
+            found_count += 1;
+            let elapsed = format_elapsed(scan_started_at.elapsed());
+            println!(
+                "{:>2} {:>9} {:<20} {:>6} open",
+                found_count, elapsed, open.ip, open.port
+            );
             open_ports.push(open);
         }
     }
 
+    println!("-- --------- -------------------- ------ ------");
+    println!(
+        "Resumen: {} abierto(s) de {} comprobaciones.",
+        found_count, total_checks
+    );
+
     open_ports.sort_by_key(|item| (item.ip, item.port));
     open_ports
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let total_millis = duration.as_millis();
+    let seconds = total_millis / 1_000;
+    let millis = total_millis % 1_000;
+    format!("{seconds:>2}.{millis:03}s")
 }
 
 impl WasmEngine {
@@ -657,9 +695,18 @@ fn print_report(reports: &[PortReport]) {
         return;
     }
 
-    println!("Puertos abiertos detectados:\n");
+    let has_scripts = reports.iter().any(|report| !report.scripts.is_empty());
+    if !has_scripts {
+        return;
+    }
+
+    println!("\nResultados de scripts:\n");
 
     for report in reports {
+        if report.scripts.is_empty() {
+            continue;
+        }
+
         println!("{} {:>5}/tcp {}", report.ip, report.port, report.state);
 
         for script in &report.scripts {
