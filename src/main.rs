@@ -4,6 +4,7 @@ mod models;
 mod network;
 mod report;
 mod services;
+mod update;
 mod wasm;
 
 use crate::cli::{parse_cli, parse_ports, parse_timing, should_show_closed_in_live};
@@ -12,6 +13,7 @@ use crate::models::{PortReport, TimingProfile};
 use crate::network::{clamp_concurrency, resolve_targets, scan_targets};
 use crate::report::{paint, print_report, supports_color, write_report_file, LiveReporter};
 use crate::services::get_service_name;
+use crate::update::update_scripts;
 use crate::wasm::WasmEngine;
 use anyhow::{bail, Context, Result};
 
@@ -26,6 +28,21 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = parse_cli();
     let default_scripts_dir = ensure_default_scripts_dir()?;
+
+    if cli.update {
+        update_scripts(&default_scripts_dir).await?;
+        println!(
+            "[+] Actualización completada. Plugins guardados en {}",
+            default_scripts_dir.display()
+        );
+        return Ok(());
+    }
+
+    let target = cli
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Debes especificar un objetivo o usar --update"))?;
+
     let (wasm_engine, using_default_scripts_dir) = if cli.script.is_empty() {
         if has_wasm_files(&default_scripts_dir)? {
             (Some(WasmEngine::load(&default_scripts_dir)?), true)
@@ -54,9 +71,9 @@ async fn run() -> Result<()> {
         );
     }
 
-    let targets = resolve_targets(&cli.target)
+    let targets = resolve_targets(target)
         .await
-        .with_context(|| format!("No se pudo resolver target '{}'", cli.target))?;
+        .with_context(|| format!("No se pudo resolver target '{}'", target))?;
 
     if targets.is_empty() {
         bail!("No se encontraron IPs válidas para escanear");

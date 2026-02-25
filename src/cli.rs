@@ -15,7 +15,12 @@ use crate::models::TimingProfile;
 )]
 pub struct Cli {
     /// Objetivo a escanear: IP, rango (A.B.C.D-E.F.G.H), CIDR o dominio
-    pub target: String,
+    #[arg(required_unless_present = "update")]
+    pub target: Option<String>,
+
+    /// Actualiza los plugins Wasm oficiales desde GitHub
+    #[arg(long = "update")]
+    pub update: bool,
 
     /// Puertos: "80,443", "1-1024" o "-" para todos
     #[arg(short = 'p', long = "ports", default_value = "-")]
