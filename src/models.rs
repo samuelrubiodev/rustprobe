@@ -25,6 +25,7 @@ pub struct PortReport {
     pub ip: IpAddr,
     pub port: u16,
     pub state: &'static str,
+    pub service_name: &'static str,
     pub scripts: Vec<ScriptResult>,
 }
 

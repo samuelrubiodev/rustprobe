@@ -1,4 +1,5 @@
 use crate::models::PortReport;
+use crate::services::get_service_name;
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
@@ -18,7 +19,7 @@ impl LiveReporter {
         println!(
             "\n{}",
             paint(
-                "#  Tiempo    Host                 Puerto Estado",
+                "#  Tiempo    Host                 Puerto Estado Servicio",
                 "1;37",
                 colors_enabled
             )
@@ -26,7 +27,7 @@ impl LiveReporter {
         println!(
             "{}",
             paint(
-                "-- --------- -------------------- ------ ------",
+                "-- --------- -------------------- ------ ------ ---------------",
                 "2;37",
                 colors_enabled
             )
@@ -42,13 +43,15 @@ impl LiveReporter {
     pub fn on_open(&self, index: usize, ip: IpAddr, port: u16) {
         let elapsed = self.elapsed();
         let label = paint("open", "1;32", self.colors_enabled);
+        let service = get_service_name(port);
         println!(
-            "{:>2} {:>9} {:<20} {:>6} {}",
+            "{:>2} {:>9} {:<20} {:>6}/tcp {} {}",
             index,
             format_elapsed(elapsed),
             ip,
             port,
-            label
+            label,
+            service
         );
     }
 
@@ -73,7 +76,7 @@ impl LiveReporter {
         println!(
             "{}",
             paint(
-                "-- --------- -------------------- ------ ------",
+                "-- --------- -------------------- ------ ------ ---------------",
                 "2;37",
                 self.colors_enabled
             )
@@ -129,7 +132,10 @@ pub fn print_report(reports: &[PortReport]) {
             continue;
         }
 
-        println!("{} {:>5}/tcp {}", report.ip, report.port, report.state);
+        println!(
+            "{} {:>5}/tcp {} {}",
+            report.ip, report.port, report.state, report.service_name
+        );
 
         for script in &report.scripts {
             println!(
@@ -151,8 +157,8 @@ pub fn write_report_file(path: &Path, reports: &[PortReport]) -> Result<()> {
     for report in reports {
         writeln!(
             file,
-            "{} {:>5}/tcp {}",
-            report.ip, report.port, report.state
+            "{} {:>5}/tcp {} {}",
+            report.ip, report.port, report.state, report.service_name
         )?;
 
         for script in &report.scripts {
