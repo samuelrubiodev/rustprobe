@@ -91,7 +91,18 @@ pub async fn scan_targets(
                 drop(permit);
 
                 match result {
-                    Ok(Ok(_stream)) => (ip, port, true),
+                    Ok(Ok(stream)) => {
+                        let is_self_connect = match (stream.local_addr(), stream.peer_addr()) {
+                            (Ok(local), Ok(peer)) => local == peer,
+                            _ => false,
+                        };
+
+                        if is_self_connect {
+                            (ip, port, false)
+                        } else {
+                            (ip, port, true)
+                        }
+                    }
                     _ => (ip, port, false),
                 }
             }));
