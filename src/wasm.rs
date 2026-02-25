@@ -1,0 +1,405 @@
+use crate::models::{ScriptResult, WasmScanInput};
+use anyhow::{anyhow, bail, Context, Result};
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::path::Path;
+use std::time::Duration;
+use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
+
+pub struct WasmEngine {
+    engine: Engine,
+    modules: Vec<(String, Module)>,
+}
+
+impl WasmEngine {
+    pub fn load(path: &Path) -> Result<Self> {
+        let engine = Engine::default();
+        let modules = load_wasm_modules(&engine, path)?;
+
+        if modules.is_empty() {
+            bail!("No se encontraron módulos Wasm en {}", path.display());
+        }
+
+        Ok(Self { engine, modules })
+    }
+
+    pub fn run_scripts(&self, ip: IpAddr, port: u16) -> Result<Vec<ScriptResult>> {
+        let mut results = Vec::with_capacity(self.modules.len());
+
+        for (script_name, module) in &self.modules {
+            match self.run_single(module, ip, port) {
+                Ok(output) => results.push(ScriptResult {
+                    script: script_name.clone(),
+                    status: "ok".to_string(),
+                    details: output,
+                }),
+                Err(err) => results.push(ScriptResult {
+                    script: script_name.clone(),
+                    status: "error".to_string(),
+                    details: format!("{err:#}"),
+                }),
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn run_single(&self, module: &Module, ip: IpAddr, port: u16) -> Result<String> {
+        let input_bytes = serialize_scan_input(ip, port)?;
+        let (mut store, mut linker) = prepare_store_and_linker(&self.engine)?;
+
+        let instance = instantiate_module(&mut store, &mut linker, module)?;
+        let exports = resolve_exports(&mut store, &instance)?;
+
+        let (in_ptr, in_len) =
+            write_input_to_guest(&mut store, &exports.memory, &exports.alloc, &input_bytes)?;
+
+        let packed = exports.analyze.call(&mut store, (in_ptr, in_len))?;
+
+        if let Some(func) = &exports.dealloc {
+            let _ = func.call(&mut store, (in_ptr, in_len));
+        }
+
+        let (out_ptr, out_len) = unpack_output(packed);
+        read_output_from_guest(
+            &mut store,
+            &exports.memory,
+            out_ptr,
+            out_len,
+            exports.dealloc.as_ref(),
+        )
+    }
+}
+
+struct GuestExports {
+    memory: Memory,
+    alloc: TypedFunc<i32, i32>,
+    analyze: TypedFunc<(i32, i32), i64>,
+    dealloc: Option<TypedFunc<(i32, i32), ()>>,
+}
+
+fn prepare_store_and_linker(engine: &Engine) -> Result<(Store<()>, Linker<()>)> {
+    let store = Store::new(engine, ());
+    let mut linker = Linker::new(engine);
+    configure_host_send_tcp(&mut linker)?;
+    Ok((store, linker))
+}
+
+fn configure_host_send_tcp(linker: &mut Linker<()>) -> Result<()> {
+    linker.func_wrap("env", "host_send_tcp", host_send_tcp)?;
+    Ok(())
+}
+
+fn instantiate_module(
+    store: &mut Store<()>,
+    linker: &mut Linker<()>,
+    module: &Module,
+) -> Result<Instance> {
+    linker
+        .instantiate(store, module)
+        .context("No se pudo instanciar el módulo Wasm")
+}
+
+fn resolve_exports(store: &mut Store<()>, instance: &Instance) -> Result<GuestExports> {
+    let memory = instance
+        .get_memory(&mut *store, "memory")
+        .ok_or_else(|| anyhow!("El módulo no exporta 'memory'"))?;
+
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&mut *store, "alloc")
+        .context("El módulo no exporta alloc(i32)->i32")?;
+
+    let analyze = instance
+        .get_typed_func::<(i32, i32), i64>(&mut *store, "analyze")
+        .context("El módulo no exporta analyze(i32,i32)->i64")?;
+
+    let dealloc = instance
+        .get_typed_func::<(i32, i32), ()>(&mut *store, "dealloc")
+        .ok();
+
+    Ok(GuestExports {
+        memory,
+        alloc,
+        analyze,
+        dealloc,
+    })
+}
+
+fn write_input_to_guest(
+    store: &mut Store<()>,
+    memory: &Memory,
+    alloc: &TypedFunc<i32, i32>,
+    input_bytes: &[u8],
+) -> Result<(i32, i32)> {
+    let in_len = i32::try_from(input_bytes.len()).context("Input demasiado grande para ABI i32")?;
+    let in_ptr = alloc.call(&mut *store, in_len)?;
+
+    memory
+        .write(
+            &mut *store,
+            usize::try_from(in_ptr).context("Puntero alloc inválido")?,
+            input_bytes,
+        )
+        .context("No se pudo escribir input en memoria Wasm")?;
+
+    Ok((in_ptr, in_len))
+}
+
+fn unpack_output(packed: i64) -> (u32, u32) {
+    let packed = packed as u64;
+    ((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)
+}
+
+fn read_output_from_guest(
+    store: &mut Store<()>,
+    memory: &Memory,
+    out_ptr: u32,
+    out_len: u32,
+    dealloc: Option<&TypedFunc<(i32, i32), ()>>,
+) -> Result<String> {
+    if out_len == 0 {
+        return Ok(String::new());
+    }
+
+    let out_offset = usize::try_from(out_ptr).context("Puntero de salida inválido")?;
+    let out_size = usize::try_from(out_len).context("Longitud de salida inválida")?;
+
+    let memory_size = memory.data_size(&mut *store);
+    let end = out_offset
+        .checked_add(out_size)
+        .ok_or_else(|| anyhow!("Overflow al leer salida de Wasm"))?;
+
+    if end > memory_size {
+        bail!(
+            "Salida Wasm fuera de límites de memoria (offset={}, len={}, memory={})",
+            out_offset,
+            out_size,
+            memory_size
+        );
+    }
+
+    let mut output = vec![0u8; out_size];
+    memory
+        .read(&mut *store, out_offset, &mut output)
+        .context("No se pudo leer salida de memoria Wasm")?;
+
+    if let Some(func) = dealloc {
+        let out_ptr_i32 = i32::try_from(out_ptr).context("Puntero de salida fuera de rango i32")?;
+        let out_len_i32 =
+            i32::try_from(out_len).context("Longitud de salida fuera de rango i32")?;
+        let _ = func.call(&mut *store, (out_ptr_i32, out_len_i32));
+    }
+
+    let text = String::from_utf8(output).context("Salida Wasm no es UTF-8")?;
+    Ok(text)
+}
+
+fn serialize_scan_input(ip: IpAddr, port: u16) -> Result<Vec<u8>> {
+    let input = WasmScanInput {
+        ip: ip.to_string(),
+        port,
+    };
+    Ok(serde_json::to_vec(&input)?)
+}
+
+fn host_send_tcp(
+    mut caller: Caller<'_, ()>,
+    ip_ptr: i32,
+    ip_len: i32,
+    port: i32,
+    payload_ptr: i32,
+    payload_len: i32,
+) -> i64 {
+    if ip_ptr <= 0 || ip_len <= 0 || payload_ptr <= 0 || payload_len <= 0 {
+        return 0;
+    }
+
+    let Some(memory) = caller
+        .get_export("memory")
+        .and_then(|item| item.into_memory())
+    else {
+        return 0;
+    };
+
+    let Ok(ip_offset) = usize::try_from(ip_ptr) else {
+        return 0;
+    };
+    let Ok(ip_size) = usize::try_from(ip_len) else {
+        return 0;
+    };
+    let Ok(payload_offset) = usize::try_from(payload_ptr) else {
+        return 0;
+    };
+    let Ok(payload_size) = usize::try_from(payload_len) else {
+        return 0;
+    };
+
+    let memory_size = memory.data_size(&caller);
+
+    let ip_end = match ip_offset.checked_add(ip_size) {
+        Some(end) if end <= memory_size => end,
+        _ => return 0,
+    };
+
+    let payload_end = match payload_offset.checked_add(payload_size) {
+        Some(end) if end <= memory_size => end,
+        _ => return 0,
+    };
+
+    if ip_end == ip_offset || payload_end == payload_offset {
+        return 0;
+    }
+
+    let mut ip_bytes = vec![0u8; ip_size];
+    if memory.read(&caller, ip_offset, &mut ip_bytes).is_err() {
+        return 0;
+    }
+
+    let mut payload = vec![0u8; payload_size];
+    if memory.read(&caller, payload_offset, &mut payload).is_err() {
+        return 0;
+    }
+
+    let ip_text = match std::str::from_utf8(&ip_bytes) {
+        Ok(text) => text,
+        Err(_) => return 0,
+    };
+
+    let ip_addr = match ip_text.parse::<IpAddr>() {
+        Ok(addr) => addr,
+        Err(_) => return 0,
+    };
+
+    let port_u16 = match u16::try_from(port) {
+        Ok(value) if value > 0 => value,
+        _ => return 0,
+    };
+
+    let socket = SocketAddr::new(ip_addr, port_u16);
+    let mut stream = match TcpStream::connect_timeout(&socket, Duration::from_secs(2)) {
+        Ok(stream) => stream,
+        Err(_) => return 0,
+    };
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    if stream.write_all(&payload).is_err() {
+        return 0;
+    }
+
+    let mut response = Vec::new();
+    let mut temp = [0u8; 4096];
+
+    loop {
+        match stream.read(&mut temp) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&temp[..n]),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                break;
+            }
+            Err(_) => return 0,
+        }
+    }
+
+    if response.is_empty() {
+        return 0;
+    }
+
+    let out_len = match i32::try_from(response.len()) {
+        Ok(len) => len,
+        Err(_) => return 0,
+    };
+
+    let Some(alloc_func) = caller.get_export("alloc").and_then(|item| item.into_func()) else {
+        return 0;
+    };
+
+    let alloc = match alloc_func.typed::<i32, i32>(&caller) {
+        Ok(func) => func,
+        Err(_) => return 0,
+    };
+
+    let out_ptr = match alloc.call(&mut caller, out_len) {
+        Ok(ptr) if ptr > 0 => ptr,
+        _ => return 0,
+    };
+
+    let Ok(out_offset) = usize::try_from(out_ptr) else {
+        return 0;
+    };
+    let Ok(out_size) = usize::try_from(out_len) else {
+        return 0;
+    };
+
+    let write_end = match out_offset.checked_add(out_size) {
+        Some(end) if end <= memory.data_size(&caller) => end,
+        _ => return 0,
+    };
+
+    if write_end == out_offset {
+        return 0;
+    }
+
+    if memory.write(&mut caller, out_offset, &response).is_err() {
+        return 0;
+    }
+
+    pack_ptr_len(out_ptr, out_len)
+}
+
+fn pack_ptr_len(ptr: i32, len: i32) -> i64 {
+    (((ptr as u32 as u64) << 32) | (len as u32 as u64)) as i64
+}
+
+fn load_wasm_modules(engine: &Engine, path: &Path) -> Result<Vec<(String, Module)>> {
+    if path.is_file() {
+        let module = Module::from_file(engine, path)
+            .with_context(|| format!("No se pudo cargar módulo {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or("script.wasm")
+            .to_string();
+        return Ok(vec![(name, module)]);
+    }
+
+    if path.is_dir() {
+        let mut modules = Vec::new();
+
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let file_path = entry.path();
+
+            let is_wasm = file_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("wasm"))
+                .unwrap_or(false);
+
+            if !is_wasm {
+                continue;
+            }
+
+            let module = Module::from_file(engine, &file_path)
+                .with_context(|| format!("No se pudo cargar módulo {}", file_path.display()))?;
+
+            let name = file_path
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("unknown.wasm")
+                .to_string();
+
+            modules.push((name, module));
+        }
+
+        modules.sort_by(|a, b| a.0.cmp(&b.0));
+        return Ok(modules);
+    }
+
+    bail!("La ruta de script no existe: {}", path.display())
+}
