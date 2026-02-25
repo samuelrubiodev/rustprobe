@@ -43,24 +43,23 @@ async fn run() -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("Debes especificar un objetivo o usar --update"))?;
 
-    let (wasm_engine, using_default_scripts_dir) = if cli.script.is_empty() {
+    let wasm_engine = if !cli.script.is_empty() {
+        Some(WasmEngine::load_named_from_dir(
+            &default_scripts_dir,
+            &cli.script,
+        )?)
+    } else if cli.default_scripts {
         if has_wasm_files(&default_scripts_dir)? {
-            (Some(WasmEngine::load(&default_scripts_dir)?), true)
+            Some(WasmEngine::load(&default_scripts_dir)?)
         } else {
             println!(
-                "[i] Directorio de scripts local vacío. Añade archivos .wasm en {} para activar el análisis.",
+                "[i] Directorio de scripts local vacío. Añade archivos .wasm en {} para usar --default-scripts.",
                 default_scripts_dir.display()
             );
-            (None, true)
+            None
         }
     } else {
-        (
-            Some(WasmEngine::load_named_from_dir(
-                &default_scripts_dir,
-                &cli.script,
-            )?),
-            false,
-        )
+        None
     };
 
     if !cli.script.is_empty() {
@@ -105,8 +104,8 @@ async fn run() -> Result<()> {
         open_ports.len()
     );
 
-    if wasm_engine.is_some() && using_default_scripts_dir {
-        println!("[+] Plugins Wasm locales detectados. Análisis adicional activado automáticamente.");
+    if cli.default_scripts && wasm_engine.is_some() && cli.script.is_empty() {
+        println!("[+] Plugins Wasm locales detectados. Análisis adicional activado por --default-scripts.");
     }
 
     let mut reports = Vec::with_capacity(open_ports.len());

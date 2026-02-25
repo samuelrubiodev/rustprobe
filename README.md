@@ -72,6 +72,7 @@ Opciones principales:
 - --script: nombre(s) de script Wasm (ej. `--script smb,http`).
 	- Los nombres se resuelven en el directorio local estándar del usuario en `data_dir()/scripts`.
 	- Ejemplos típicos: Linux `~/.local/share/rustprobe/scripts`, Windows `%APPDATA%\rustprobe\scripts`.
+- -C, --default-scripts: ejecuta todos los scripts Wasm del directorio local estándar (opt-in, equivalente a Nmap `-sC`).
 - -o, --output: archivo de salida.
 - Compatibilidad Nmap: -oN archivo o -oNarchivo.
 
@@ -82,6 +83,7 @@ cargo run -- 127.0.0.1 -p 80,443,90 -T T3
 cargo run -- 192.0.2.10-192.0.2.20 -p 1-1024 -oN ./scan.txt
 cargo run -- 127.0.0.1 -p 80,443 --script smb
 cargo run -- example.com -p 80,443 --script smb,http
+cargo run -- 127.0.0.1 -p 80,443 -C
 cargo run -- 127.0.0.1 -p 80,443
 ```
 
@@ -100,9 +102,10 @@ Comportamiento de color:
 - Se habilita solo si stdout es terminal interactiva.
 - Si NO_COLOR está definido, se desactiva color.
 
-Cuando no se usa --script, rustprobe busca y ejecuta todos los plugins Wasm del directorio local estándar.
+Por defecto (sin `--script` ni `-C`), rustprobe no inicializa el motor Wasm y realiza solo el escaneo de puertos.
+Si se usa `--script`, solo se cargan y ejecutan los scripts solicitados por nombre.
+Si se usa `-C`/`--default-scripts`, se cargan todos los plugins Wasm del directorio local estándar.
 Si ese directorio no tiene archivos `.wasm`, se muestra un mensaje informativo y se continúa el escaneo sin análisis Wasm.
-Si se usa --script, solo se cargan y ejecutan los scripts solicitados por nombre.
 
 ---
 

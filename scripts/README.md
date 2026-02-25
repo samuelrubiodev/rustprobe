@@ -14,11 +14,23 @@ Esto genera:
 
 ## 2) Ejecutar RustProbe con plugin
 
-Ejemplo (localhost, puertos comunes):
+Los scripts Wasm en RustProbe son **opt-in**:
+
+- Sin `--script` ni `-C`, no se ejecuta ningún script Wasm.
+- Con `--script`, se ejecutan scripts específicos por nombre.
+- Con `-C` / `--default-scripts`, se ejecutan todos los scripts del directorio estándar local.
+
+Ejemplos (localhost, puertos comunes):
 
 ```powershell
-cargo run -- 127.0.0.1 -p 22,80,443 -T T4 --script ./scripts/sample_plugin.wasm -oN ./scan.txt
+cargo run -- 127.0.0.1 -p 22,80,443 -T T4 --script sample_plugin -oN ./scan.txt
+cargo run -- 127.0.0.1 -p 22,80,443 -T T4 -C -oN ./scan.txt
 ```
+
+Notas:
+
+- `--script` recibe nombres separados por coma (ej. `--script smb,http`).
+- Los nombres se buscan en el directorio local estándar (`data_dir()/scripts`).
 
 ## ABI esperada por el host
 

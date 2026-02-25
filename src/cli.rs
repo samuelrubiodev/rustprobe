@@ -11,7 +11,9 @@ use crate::models::TimingProfile;
 #[command(
     name = "rustprobe",
     version,
-    about = "Escáner de red de alto rendimiento con motor de plugins Wasm"
+    about = "Escáner de red de alto rendimiento con motor de plugins Wasm",
+    next_line_help = true,
+    after_help = "Notas:\n  - El análisis Wasm es opt-in: solo se activa con --script o -C/--default-scripts.\n  - -oN (nmap) es compatible y se normaliza a --output.\n\nEjemplos:\n  rustprobe 10.0.2.16 -p 80\n  rustprobe 10.0.2.16 -p 80,443 --script http\n  rustprobe 10.0.2.16 -p 1-1024 -C\n  rustprobe --update"
 )]
 pub struct Cli {
     /// Objetivo a escanear: IP, rango (A.B.C.D-E.F.G.H), CIDR o dominio
@@ -33,6 +35,10 @@ pub struct Cli {
     /// Script(s) Wasm por nombre (ej: --script smb,http), buscados en el directorio local estándar
     #[arg(long = "script", value_delimiter = ',')]
     pub script: Vec<String>,
+
+    /// Ejecuta todos los scripts Wasm del directorio local por defecto (equivalente a Nmap -sC)
+    #[arg(short = 'C', long = "default-scripts")]
+    pub default_scripts: bool,
 
     /// Archivo de salida (compatibilidad nmap: -oN)
     #[arg(short = 'o', long = "output")]
