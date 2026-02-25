@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{lookup_host, TcpStream as TokioTcpStream};
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Duration as TokioDuration};
+use tokio::time::{timeout, Duration as TokioDuration, Instant};
 
 const MAX_CONCURRENCY: usize = 2_048;
 
@@ -60,6 +60,33 @@ pub async fn resolve_targets(target: &str) -> Result<Vec<IpAddr>> {
     Ok(resolved.into_iter().collect())
 }
 
+pub async fn measure_rtt(ip: IpAddr) -> Option<TokioDuration> {
+    let start = Instant::now();
+    let mut attempts = FuturesUnordered::new();
+
+    for port in [80_u16, 443_u16, 22_u16] {
+        let addr = SocketAddr::new(ip, port);
+        attempts.push(async move {
+            timeout(TokioDuration::from_secs(2), TokioTcpStream::connect(addr)).await
+        });
+    }
+
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                return Some(start.elapsed());
+            }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return Some(start.elapsed());
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 pub async fn scan_targets(
     targets: &[IpAddr],
     ports: &[u16],
@@ -71,9 +98,26 @@ pub async fn scan_targets(
     let total_checks = targets.len().saturating_mul(ports.len());
 
     for &ip in targets {
+        let ip_timeout_ms = match measure_rtt(ip).await {
+            Some(rtt) => {
+                let dynamic_timeout = (rtt.as_millis() as u64)
+                    .saturating_mul(3)
+                    .saturating_div(2)
+                    .saturating_add(20);
+                let adjusted_timeout = dynamic_timeout.max(timing.timeout_ms);
+                println!(
+                    "[i] Latencia a {ip}: {}ms (timeout {}ms)",
+                    rtt.as_millis(),
+                    adjusted_timeout
+                );
+                adjusted_timeout
+            }
+            None => timing.timeout_ms,
+        };
+
         for &port in ports {
             let semaphore = Arc::clone(&semaphore);
-            let timeout_ms = timing.timeout_ms;
+            let timeout_ms = ip_timeout_ms;
 
             tasks.push(tokio::spawn(async move {
                 let permit = match semaphore.acquire_owned().await {
