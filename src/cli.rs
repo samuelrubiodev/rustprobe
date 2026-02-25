@@ -25,7 +25,7 @@ pub struct Cli {
     #[arg(short = 'T', long = "timing", default_value = "T3")]
     pub timing: String,
 
-    /// Script .wasm específico o directorio con scripts
+    /// Script .wasm específico o directorio con scripts (si se omite, usa el directorio local estándar)
     #[arg(long = "script")]
     pub script: Option<PathBuf>,
 

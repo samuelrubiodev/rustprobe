@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod models;
 mod network;
 mod report;
@@ -6,6 +7,7 @@ mod services;
 mod wasm;
 
 use crate::cli::{parse_cli, parse_ports, parse_timing, should_show_closed_in_live};
+use crate::config::{ensure_default_scripts_dir, has_wasm_files};
 use crate::models::{PortReport, TimingProfile};
 use crate::network::{clamp_concurrency, resolve_targets, scan_targets};
 use crate::report::{paint, print_report, supports_color, write_report_file, LiveReporter};
@@ -23,6 +25,25 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = parse_cli();
+    let script_path = if let Some(path) = cli.script.clone() {
+        path
+    } else {
+        ensure_default_scripts_dir()?
+    };
+
+    let (wasm_engine, using_default_scripts_dir) = if cli.script.is_none() {
+        if has_wasm_files(&script_path)? {
+            (Some(WasmEngine::load(&script_path)?), true)
+        } else {
+            println!(
+                "[i] Directorio de scripts local vacío. Añade archivos .wasm en {} para activar el análisis.",
+                script_path.display()
+            );
+            (None, true)
+        }
+    } else {
+        (Some(WasmEngine::load(&script_path)?), false)
+    };
 
     let targets = resolve_targets(&cli.target)
         .await
@@ -58,10 +79,9 @@ async fn run() -> Result<()> {
         open_ports.len()
     );
 
-    let wasm_engine = match &cli.script {
-        Some(script_path) if !open_ports.is_empty() => Some(WasmEngine::load(script_path)?),
-        _ => None,
-    };
+    if wasm_engine.is_some() && using_default_scripts_dir {
+        println!("[+] Plugins Wasm locales detectados. Análisis adicional activado automáticamente.");
+    }
 
     let mut reports = Vec::with_capacity(open_ports.len());
     for open in open_ports {
