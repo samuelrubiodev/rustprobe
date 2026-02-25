@@ -65,7 +65,10 @@ pub fn parse_timing(value: &str) -> Result<TimingProfile> {
         _ => bail!("Timing inválido '{}'. Valores permitidos: T1..T5", value),
     };
 
-    Ok(profile)
+    Ok(TimingProfile {
+        timeout_ms: profile.timeout_ms.max(800),
+        ..profile
+    })
 }
 
 pub fn parse_ports(raw: &str) -> Result<Vec<u16>> {
