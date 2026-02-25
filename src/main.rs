@@ -83,6 +83,7 @@ async fn run() -> Result<()> {
     let timing = TimingProfile {
         concurrency: clamp_concurrency(timing.concurrency),
         timeout_ms: timing.timeout_ms,
+        retries: timing.retries,
     };
     let colors_enabled = supports_color();
     let show_closed_in_live = should_show_closed_in_live(&cli.ports);

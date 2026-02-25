@@ -5,6 +5,7 @@ use std::net::IpAddr;
 pub struct TimingProfile {
     pub concurrency: usize,
     pub timeout_ms: u64,
+    pub retries: u32,
 }
 
 #[derive(Debug, Clone)]

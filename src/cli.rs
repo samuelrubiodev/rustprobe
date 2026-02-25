@@ -56,30 +56,32 @@ pub fn parse_timing(value: &str) -> Result<TimingProfile> {
         "T1" => TimingProfile {
             concurrency: 64,
             timeout_ms: 2_500,
+            retries: 3,
         },
         "T2" => TimingProfile {
             concurrency: 256,
             timeout_ms: 1_500,
+            retries: 3,
         },
         "T3" => TimingProfile {
             concurrency: 1_024,
             timeout_ms: 800,
+            retries: 2,
         },
         "T4" => TimingProfile {
             concurrency: 4_096,
             timeout_ms: 350,
+            retries: 1,
         },
         "T5" => TimingProfile {
             concurrency: 12_288,
             timeout_ms: 120,
+            retries: 1,
         },
         _ => bail!("Timing inválido '{}'. Valores permitidos: T1..T5", value),
     };
 
-    Ok(TimingProfile {
-        timeout_ms: profile.timeout_ms.max(800),
-        ..profile
-    })
+    Ok(profile)
 }
 
 pub fn parse_ports(raw: &str) -> Result<Vec<u16>> {

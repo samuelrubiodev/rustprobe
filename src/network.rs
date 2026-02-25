@@ -3,7 +3,7 @@ use crate::report::LiveReporter;
 use anyhow::{bail, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use ipnet::IpNet;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{lookup_host, TcpStream as TokioTcpStream};
@@ -97,8 +97,14 @@ pub async fn scan_targets(
     let mut tasks = FuturesUnordered::new();
     let total_checks = targets.len().saturating_mul(ports.len());
 
+    let mut rtt_tasks = FuturesUnordered::new();
     for &ip in targets {
-        let ip_timeout_ms = match measure_rtt(ip).await {
+        rtt_tasks.push(async move { (ip, measure_rtt(ip).await) });
+    }
+
+    let mut timeout_by_ip = HashMap::with_capacity(targets.len());
+    while let Some((ip, rtt)) = rtt_tasks.next().await {
+        let timeout_ms = match rtt {
             Some(rtt) => {
                 let dynamic_timeout = (rtt.as_millis() as u64)
                     .saturating_mul(3)
@@ -115,9 +121,16 @@ pub async fn scan_targets(
             None => timing.timeout_ms,
         };
 
+        timeout_by_ip.insert(ip, timeout_ms);
+    }
+
+    for &ip in targets {
+        let ip_timeout_ms = timeout_by_ip.get(&ip).copied().unwrap_or(timing.timeout_ms);
+
         for &port in ports {
             let semaphore = Arc::clone(&semaphore);
             let timeout_ms = ip_timeout_ms;
+            let retries = timing.retries;
 
             tasks.push(tokio::spawn(async move {
                 let permit = match semaphore.acquire_owned().await {
@@ -126,29 +139,38 @@ pub async fn scan_targets(
                 };
 
                 let addr = SocketAddr::new(ip, port);
-                let result = timeout(
-                    TokioDuration::from_millis(timeout_ms),
-                    TokioTcpStream::connect(addr),
-                )
-                .await;
+                let mut is_open = false;
+
+                for attempt in 0..=retries {
+                    let result = timeout(
+                        TokioDuration::from_millis(timeout_ms),
+                        TokioTcpStream::connect(addr),
+                    )
+                    .await;
+
+                    match result {
+                        Ok(Ok(stream)) => {
+                            let is_self_connect = match (stream.local_addr(), stream.peer_addr()) {
+                                (Ok(local), Ok(peer)) => local == peer,
+                                _ => false,
+                            };
+
+                            if !is_self_connect {
+                                is_open = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    if attempt < retries {
+                        tokio::time::sleep(TokioDuration::from_millis(50)).await;
+                    }
+                }
 
                 drop(permit);
 
-                match result {
-                    Ok(Ok(stream)) => {
-                        let is_self_connect = match (stream.local_addr(), stream.peer_addr()) {
-                            (Ok(local), Ok(peer)) => local == peer,
-                            _ => false,
-                        };
-
-                        if is_self_connect {
-                            (ip, port, false)
-                        } else {
-                            (ip, port, true)
-                        }
-                    }
-                    _ => (ip, port, false),
-                }
+                (ip, port, is_open)
             }));
         }
     }
