@@ -10,6 +10,12 @@ use tokio::net::{lookup_host, TcpStream as TokioTcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration as TokioDuration};
 
+const MAX_CONCURRENCY: usize = 2_048;
+
+pub fn clamp_concurrency(value: usize) -> usize {
+    value.min(MAX_CONCURRENCY).max(1)
+}
+
 pub async fn resolve_targets(target: &str) -> Result<Vec<IpAddr>> {
     if let Ok(ip) = target.parse::<IpAddr>() {
         return Ok(vec![ip]);
@@ -60,7 +66,7 @@ pub async fn scan_targets(
     timing: TimingProfile,
     reporter: &LiveReporter,
 ) -> Vec<OpenPort> {
-    let semaphore = Arc::new(Semaphore::new(timing.concurrency));
+    let semaphore = Arc::new(Semaphore::new(clamp_concurrency(timing.concurrency)));
     let mut tasks = FuturesUnordered::new();
     let total_checks = targets.len().saturating_mul(ports.len());
 
