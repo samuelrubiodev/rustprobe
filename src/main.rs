@@ -2,12 +2,14 @@ mod cli;
 mod models;
 mod network;
 mod report;
+mod services;
 mod wasm;
 
 use crate::cli::{parse_cli, parse_ports, parse_timing};
 use crate::models::{PortReport, TimingProfile};
 use crate::network::{clamp_concurrency, resolve_targets, scan_targets};
 use crate::report::{paint, print_report, supports_color, write_report_file, LiveReporter};
+use crate::services::get_service_name;
 use crate::wasm::WasmEngine;
 use anyhow::{bail, Context, Result};
 
@@ -75,6 +77,7 @@ async fn run() -> Result<()> {
             ip: open.ip,
             port: open.port,
             state: "open",
+            service_name: get_service_name(open.port),
             scripts,
         });
     }
