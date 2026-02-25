@@ -69,8 +69,8 @@ Opciones principales:
 - target: IP, rango IPv4, CIDR o dominio.
 - -p, --ports: lista, rango o - para todos.
 - -T, --timing: T1..T5.
-- --script: ruta a un .wasm o a un directorio con .wasm.
-	- Si se omite, rustprobe usa automáticamente el directorio local estándar del usuario en `data_dir()/scripts`.
+- --script: nombre(s) de script Wasm (ej. `--script smb,http`).
+	- Los nombres se resuelven en el directorio local estándar del usuario en `data_dir()/scripts`.
 	- Ejemplos típicos: Linux `~/.local/share/rustprobe/scripts`, Windows `%APPDATA%\rustprobe\scripts`.
 - -o, --output: archivo de salida.
 - Compatibilidad Nmap: -oN archivo o -oNarchivo.
@@ -80,8 +80,8 @@ Ejemplos:
 ```powershell
 cargo run -- 127.0.0.1 -p 80,443,90 -T T3
 cargo run -- 192.0.2.10-192.0.2.20 -p 1-1024 -oN ./scan.txt
-cargo run -- 127.0.0.1 -p 80,443 --script ./scripts/sample_plugin.wasm
-cargo run -- example.com -p 80,443 --script ./scripts
+cargo run -- 127.0.0.1 -p 80,443 --script smb
+cargo run -- example.com -p 80,443 --script smb,http
 cargo run -- 127.0.0.1 -p 80,443
 ```
 
@@ -100,9 +100,9 @@ Comportamiento de color:
 - Se habilita solo si stdout es terminal interactiva.
 - Si NO_COLOR está definido, se desactiva color.
 
-Cuando no se usa --script, rustprobe busca plugins Wasm en el directorio local estándar.
+Cuando no se usa --script, rustprobe busca y ejecuta todos los plugins Wasm del directorio local estándar.
 Si ese directorio no tiene archivos `.wasm`, se muestra un mensaje informativo y se continúa el escaneo sin análisis Wasm.
-Si se usa --script, al final se imprime bloque de resultados de scripts.
+Si se usa --script, solo se cargan y ejecutan los scripts solicitados por nombre.
 
 ---
 

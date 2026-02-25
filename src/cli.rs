@@ -25,9 +25,9 @@ pub struct Cli {
     #[arg(short = 'T', long = "timing", default_value = "T3")]
     pub timing: String,
 
-    /// Script .wasm específico o directorio con scripts (si se omite, usa el directorio local estándar)
-    #[arg(long = "script")]
-    pub script: Option<PathBuf>,
+    /// Script(s) Wasm por nombre (ej: --script smb,http), buscados en el directorio local estándar
+    #[arg(long = "script", value_delimiter = ',')]
+    pub script: Vec<String>,
 
     /// Archivo de salida (compatibilidad nmap: -oN)
     #[arg(short = 'o', long = "output")]

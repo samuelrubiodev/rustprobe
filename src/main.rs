@@ -25,25 +25,34 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = parse_cli();
-    let script_path = if let Some(path) = cli.script.clone() {
-        path
-    } else {
-        ensure_default_scripts_dir()?
-    };
-
-    let (wasm_engine, using_default_scripts_dir) = if cli.script.is_none() {
-        if has_wasm_files(&script_path)? {
-            (Some(WasmEngine::load(&script_path)?), true)
+    let default_scripts_dir = ensure_default_scripts_dir()?;
+    let (wasm_engine, using_default_scripts_dir) = if cli.script.is_empty() {
+        if has_wasm_files(&default_scripts_dir)? {
+            (Some(WasmEngine::load(&default_scripts_dir)?), true)
         } else {
             println!(
                 "[i] Directorio de scripts local vacío. Añade archivos .wasm en {} para activar el análisis.",
-                script_path.display()
+                default_scripts_dir.display()
             );
             (None, true)
         }
     } else {
-        (Some(WasmEngine::load(&script_path)?), false)
+        (
+            Some(WasmEngine::load_named_from_dir(
+                &default_scripts_dir,
+                &cli.script,
+            )?),
+            false,
+        )
     };
+
+    if !cli.script.is_empty() {
+        println!(
+            "[+] Cargando scripts solicitados ({}) desde {}",
+            cli.script.join(","),
+            default_scripts_dir.display()
+        );
+    }
 
     let targets = resolve_targets(&cli.target)
         .await

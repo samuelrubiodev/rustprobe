@@ -2,6 +2,7 @@ use crate::models::{ScriptResult, WasmScanInput};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::io::{Read, Write};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
@@ -43,6 +44,12 @@ impl WasmEngine {
         }
 
         Ok(results)
+    }
+
+    pub fn load_named_from_dir(dir: &Path, script_names: &[String]) -> Result<Self> {
+        let engine = Engine::default();
+        let modules = load_named_wasm_modules(&engine, dir, script_names)?;
+        Ok(Self { engine, modules })
     }
 
     fn run_single(&self, module: &Module, ip: IpAddr, port: u16) -> Result<String> {
@@ -402,4 +409,75 @@ fn load_wasm_modules(engine: &Engine, path: &Path) -> Result<Vec<(String, Module
     }
 
     bail!("La ruta de script no existe: {}", path.display())
+}
+
+fn load_named_wasm_modules(
+    engine: &Engine,
+    dir: &Path,
+    script_names: &[String],
+) -> Result<Vec<(String, Module)>> {
+    if !dir.is_dir() {
+        bail!("El directorio de scripts no existe: {}", dir.display());
+    }
+
+    let mut available = HashMap::<String, std::path::PathBuf>::new();
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        let is_wasm = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("wasm"))
+            .unwrap_or(false);
+
+        if !is_wasm {
+            continue;
+        }
+
+        if let Some(stem) = path.file_stem().and_then(|v| v.to_str()) {
+            available.insert(stem.to_ascii_lowercase(), path.clone());
+        }
+
+        if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
+            available.insert(name.to_ascii_lowercase(), path.clone());
+        }
+    }
+
+    let mut modules = Vec::new();
+
+    for raw_name in script_names {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            bail!("Se recibió un nombre de script vacío en --script");
+        }
+
+        let key = name.to_ascii_lowercase();
+        let path = if let Some(path) = available.get(&key) {
+            path.clone()
+        } else {
+            let with_ext = format!("{}.wasm", key);
+            available.get(&with_ext).cloned().ok_or_else(|| {
+                anyhow!(
+                    "No se encontró el script '{}' en {}",
+                    name,
+                    dir.display()
+                )
+            })?
+        };
+
+        let module = Module::from_file(engine, &path)
+            .with_context(|| format!("No se pudo cargar módulo {}", path.display()))?;
+
+        let module_name = path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or("unknown.wasm")
+            .to_string();
+
+        modules.push((module_name, module));
+    }
+
+    Ok(modules)
 }
