@@ -1,6 +1,7 @@
 use crate::models::PortReport;
 use crate::services::get_service_name;
 use anyhow::{Context, Result};
+use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{IsTerminal, Write};
@@ -126,6 +127,7 @@ pub fn print_report(reports: &[PortReport]) {
     }
 
     println!("\nResultados de scripts:\n");
+    let colors_enabled = supports_color();
 
     for report in reports {
         if report.scripts.is_empty() {
@@ -138,10 +140,7 @@ pub fn print_report(reports: &[PortReport]) {
         );
 
         for script in &report.scripts {
-            println!(
-                "  ├─ script={} status={} details={}",
-                script.script, script.status, script.details
-            );
+            println!("{}", format_script_details_line(&script.script, &script.details, colors_enabled));
         }
     }
 }
@@ -162,13 +161,40 @@ pub fn write_report_file(path: &Path, reports: &[PortReport]) -> Result<()> {
         )?;
 
         for script in &report.scripts {
-            writeln!(
-                file,
-                "  script={} status={} details={}",
-                script.script, script.status, script.details
-            )?;
+            writeln!(file, "{}", format_script_details_line(&script.script, &script.details, false))?;
         }
     }
 
     Ok(())
+}
+
+fn format_script_details_line(script_name: &str, details: &str, colors_enabled: bool) -> String {
+    let clean_name = script_name.trim_end_matches(".wasm");
+
+    if let Ok(value) = serde_json::from_str::<Value>(details) {
+        if let Some(summary) = value.get("summary").and_then(Value::as_str) {
+            let severity = value
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("info");
+
+            let prefix = paint("  |_", "2;37", colors_enabled);
+            let name = paint(clean_name, "2;37", colors_enabled);
+            let severity_color = severity_color_code(severity);
+            let severity_text = paint(severity, severity_color, colors_enabled);
+
+            return format!("{prefix} {name} [{severity_text}]: {summary}");
+        }
+    }
+
+    let prefix = paint("  |_", "2;37", colors_enabled);
+    let name = paint(clean_name, "2;37", colors_enabled);
+    format!("{prefix} {name} [raw]: {details}")
+}
+
+fn severity_color_code(severity: &str) -> &'static str {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" | "high" | "error" => "1;31",
+        _ => "1;33",
+    }
 }
