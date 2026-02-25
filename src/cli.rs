@@ -114,6 +114,18 @@ pub fn parse_ports(raw: &str) -> Result<Vec<u16>> {
     Ok(ports.into_iter().collect())
 }
 
+pub fn should_show_closed_in_live(raw_ports: &str) -> bool {
+    let raw = raw_ports.trim();
+    if raw == "-" {
+        return false;
+    }
+
+    raw.split(',')
+        .map(str::trim)
+        .filter(|chunk| !chunk.is_empty())
+        .all(|chunk| !chunk.contains('-'))
+}
+
 fn normalize_nmap_shortcuts(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     // Compatibilidad con sintaxis de nmap: "-oN archivo.txt" o "-oNarchivo.txt".
     let mut normalized = Vec::new();

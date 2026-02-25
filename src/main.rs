@@ -5,7 +5,7 @@ mod report;
 mod services;
 mod wasm;
 
-use crate::cli::{parse_cli, parse_ports, parse_timing};
+use crate::cli::{parse_cli, parse_ports, parse_timing, should_show_closed_in_live};
 use crate::models::{PortReport, TimingProfile};
 use crate::network::{clamp_concurrency, resolve_targets, scan_targets};
 use crate::report::{paint, print_report, supports_color, write_report_file, LiveReporter};
@@ -39,7 +39,7 @@ async fn run() -> Result<()> {
         timeout_ms: timing.timeout_ms,
     };
     let colors_enabled = supports_color();
-    let show_closed_in_live = cli.ports.trim() != "-";
+    let show_closed_in_live = should_show_closed_in_live(&cli.ports);
 
     println!(
         "{}: {} objetivo(s), {} puerto(s), concurrencia={}...",
