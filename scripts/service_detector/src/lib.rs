@@ -1,10 +1,12 @@
-use serde::{Deserialize, Serialize};
+use once_cell::sync::Lazy;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 struct WasmScanInput {
     ip: String,
     port: u16,
+    hostname: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -16,14 +18,21 @@ struct WasmScanOutput {
 
 unsafe extern "C" {
     fn host_send_tcp(
-        ip_ptr: *const u8,
-        ip_len: usize,
-        port: u16,
-        payload_ptr: *const u8,
-        payload_len: usize,
+        ip_ptr: i32,
+        ip_len: i32,
+        port: i32,
+        payload_ptr: i32,
+        payload_len: i32,
         use_tls: i32,
+        host_ptr: i32,
+        host_len: i32,
     ) -> i64;
 }
+
+static MYSQL_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)mysql_native_password|5\.0\.|5\.5\.|8\.0\.").unwrap());
+static IRC_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)NOTICE AUTH|irc").unwrap());
+static SHELL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)root@|# ").unwrap());
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alloc(len: i32) -> i32 {
@@ -59,11 +68,19 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
 
     let output_text = match parsed {
         Ok(input) => {
+            let hostname = input
+                .hostname
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(input.ip.as_str())
+                .to_string();
+
             let payload = match input.port {
                 21 | 22 | 23 | 25 | 110 | 143 | 2121 | 3306 | 5432 | 5900 | 6667 | 6697 | 1524 => Vec::new(),
                 80 | 443 | 8000 | 8080 | 8443 | _ => format!(
                     "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
-                    input.ip
+                    hostname
                 )
                 .into_bytes(),
             };
@@ -71,12 +88,14 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
             let use_tls = if input.port == 443 || input.port == 8443 { 1 } else { 0 };
             let packed_response = unsafe {
                 host_send_tcp(
-                    input.ip.as_ptr(),
-                    input.ip.len(),
-                    input.port,
-                    payload.as_ptr(),
-                    payload.len(),
+                    input.ip.as_ptr() as i32,
+                    input.ip.len() as i32,
+                    input.port as i32,
+                    payload.as_ptr() as i32,
+                    payload.len() as i32,
                     use_tls,
+                    hostname.as_ptr() as i32,
+                    hostname.len() as i32,
                 )
             } as u64;
 
@@ -136,22 +155,16 @@ fn extract_signature(response_bytes: &[u8]) -> String {
         }
     }
 
-    if let Ok(mysql_regex) = Regex::new(r"(?i)mysql_native_password|5\.0\.|5\.5\.|8\.0\.") {
-        if mysql_regex.is_match(trimmed) {
-            return format!("Service: MySQL (Banner: {})", trimmed);
-        }
+    if MYSQL_REGEX.is_match(trimmed) {
+        return format!("Service: MySQL (Banner: {})", trimmed);
     }
 
-    if let Ok(irc_regex) = Regex::new(r"(?i)NOTICE AUTH|irc") {
-        if irc_regex.is_match(trimmed) {
-            return format!("Service: IRC (Banner: {})", trimmed);
-        }
+    if IRC_REGEX.is_match(trimmed) {
+        return format!("Service: IRC (Banner: {})", trimmed);
     }
 
-    if let Ok(shell_regex) = Regex::new(r"(?i)root@|# ") {
-        if shell_regex.is_match(trimmed) {
-            return format!("Service: Bindshell/Telnet (Banner: {})", trimmed);
-        }
+    if SHELL_REGEX.is_match(trimmed) {
+        return format!("Service: Bindshell/Telnet (Banner: {})", trimmed);
     }
 
     let snippet: String = trimmed.chars().take(50).collect();

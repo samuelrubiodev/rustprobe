@@ -12,6 +12,7 @@ pub struct TimingProfile {
 pub struct OpenPort {
     pub ip: IpAddr,
     pub port: u16,
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,4 +35,5 @@ pub struct PortReport {
 pub struct WasmScanInput {
     pub ip: String,
     pub port: u16,
+    pub hostname: Option<String>,
 }

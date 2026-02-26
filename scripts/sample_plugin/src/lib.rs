@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 struct WasmScanInput {
     ip: String,
     port: u16,
+    hostname: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -22,6 +23,8 @@ unsafe extern "C" {
         payload_ptr: i32,
         payload_len: i32,
         use_tls: i32,
+        host_ptr: i32,
+        host_len: i32,
     ) -> i64;
 }
 
@@ -61,9 +64,17 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
     let parsed = serde_json::from_slice::<WasmScanInput>(input_slice);
     let output_text = match parsed {
         Ok(input) => {
+            let hostname = input
+                .hostname
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(input.ip.as_str())
+                .to_string();
+
             let request = format!(
                 "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: rustprobe-sample-plugin/1.0\r\nConnection: close\r\n\r\n",
-                input.ip
+                hostname
             );
 
             let request_bytes = request.as_bytes();
@@ -76,6 +87,8 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
                     request_bytes.as_ptr() as i32,
                     request_bytes.len() as i32,
                     use_tls,
+                    hostname.as_ptr() as i32,
+                    hostname.len() as i32,
                 )
             } as u64;
 

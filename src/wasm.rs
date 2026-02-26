@@ -27,11 +27,11 @@ impl WasmEngine {
         Ok(Self { engine, modules })
     }
 
-    pub fn run_scripts(&self, ip: IpAddr, port: u16) -> Result<Vec<ScriptResult>> {
+    pub fn run_scripts(&self, ip: IpAddr, port: u16, hostname: Option<&str>) -> Result<Vec<ScriptResult>> {
         let mut results = Vec::with_capacity(self.modules.len());
 
         for (script_name, module) in &self.modules {
-            match self.run_single(module, ip, port) {
+            match self.run_single(module, ip, port, hostname) {
                 Ok(output) => results.push(ScriptResult {
                     script: script_name.clone(),
                     status: "ok".to_string(),
@@ -54,8 +54,8 @@ impl WasmEngine {
         Ok(Self { engine, modules })
     }
 
-    fn run_single(&self, module: &Module, ip: IpAddr, port: u16) -> Result<String> {
-        let input_bytes = serialize_scan_input(ip, port)?;
+    fn run_single(&self, module: &Module, ip: IpAddr, port: u16, hostname: Option<&str>) -> Result<String> {
+        let input_bytes = serialize_scan_input(ip, port, hostname)?;
         let (mut store, mut linker) = prepare_store_and_linker(&self.engine)?;
 
         let instance = instantiate_module(&mut store, &mut linker, module)?;
@@ -204,10 +204,11 @@ fn read_output_from_guest(
     Ok(text)
 }
 
-fn serialize_scan_input(ip: IpAddr, port: u16) -> Result<Vec<u8>> {
+fn serialize_scan_input(ip: IpAddr, port: u16, hostname: Option<&str>) -> Result<Vec<u8>> {
     let input = WasmScanInput {
         ip: ip.to_string(),
         port,
+        hostname: hostname.map(|value| value.to_string()),
     };
     Ok(serde_json::to_vec(&input)?)
 }
@@ -220,6 +221,8 @@ fn host_send_tcp(
     payload_ptr: i32,
     payload_len: i32,
     use_tls: i32,
+    host_ptr: i32,
+    host_len: i32,
 ) -> i64 {
     if ip_ptr <= 0 || ip_len <= 0 {
         return 0;
@@ -286,6 +289,36 @@ fn host_send_tcp(
         None
     };
 
+    let host = if host_ptr > 0 && host_len > 0 {
+        let Ok(host_offset) = usize::try_from(host_ptr) else {
+            return 0;
+        };
+        let Ok(host_size) = usize::try_from(host_len) else {
+            return 0;
+        };
+
+        let host_end = match host_offset.checked_add(host_size) {
+            Some(end) if end <= memory_size => end,
+            _ => return 0,
+        };
+
+        if host_end == host_offset {
+            String::new()
+        } else {
+            let mut host_bytes = vec![0u8; host_size];
+            if memory.read(&caller, host_offset, &mut host_bytes).is_err() {
+                return 0;
+            }
+
+            match std::str::from_utf8(&host_bytes) {
+                Ok(value) => value.trim().to_string(),
+                Err(_) => return 0,
+            }
+        }
+    } else {
+        String::new()
+    };
+
     let ip_text = match std::str::from_utf8(&ip_bytes) {
         Ok(text) => text,
         Err(_) => return 0,
@@ -301,7 +334,13 @@ fn host_send_tcp(
         _ => return 0,
     };
 
-    let response = match run_tcp_exchange(ip_addr, port_u16, payload, use_tls == 1) {
+    let tls_hostname = if host.is_empty() {
+        ip_text.to_string()
+    } else {
+        host
+    };
+
+    let response = match run_tcp_exchange(ip_addr, port_u16, payload, use_tls == 1, tls_hostname) {
         Ok(response) => response,
         Err(_) => return 0,
     };
@@ -357,21 +396,12 @@ fn run_tcp_exchange(
     port: u16,
     payload: Option<Vec<u8>>,
     use_tls: bool,
+    tls_hostname: String,
 ) -> Result<Vec<u8>> {
-    let join = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .context("No se pudo inicializar runtime Tokio")?;
-
-        runtime.block_on(tcp_exchange_async(ip_addr, port, payload, use_tls))
-    });
-
-    match join.join() {
-        Ok(result) => result,
-        Err(_) => Err(anyhow!("Error interno al ejecutar intercambio TCP/TLS")),
-    }
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(tcp_exchange_async(ip_addr, port, payload, use_tls, tls_hostname))
+    })
 }
 
 async fn tcp_exchange_async(
@@ -379,6 +409,7 @@ async fn tcp_exchange_async(
     port: u16,
     payload: Option<Vec<u8>>,
     use_tls: bool,
+    tls_hostname: String,
 ) -> Result<Vec<u8>> {
     let socket = SocketAddr::new(ip_addr, port);
     let stream = timeout(Duration::from_secs(2), TokioTcpStream::connect(socket))
@@ -395,7 +426,11 @@ async fn tcp_exchange_async(
             .build()
             .context("No se pudo crear conector TLS")?;
         let connector = TlsConnector::from(connector);
-        let domain = ip_addr.to_string();
+        let domain = if tls_hostname.trim().is_empty() {
+            ip_addr.to_string()
+        } else {
+            tls_hostname
+        };
 
         let mut tls_stream = timeout(Duration::from_secs(3), connector.connect(&domain, stream))
             .await
