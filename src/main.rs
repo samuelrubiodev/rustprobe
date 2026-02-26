@@ -126,9 +126,7 @@ async fn run() -> Result<()> {
         println!("[+] Plugins Wasm locales detectados. Análisis adicional activado por --default-scripts.");
     }
 
-    if wasm_engine.is_none() {
-        print_report(&reports);
-    }
+    print_report(&reports);
 
     if let Some(path) = cli.output {
         write_report_file(&path, &reports)?;
