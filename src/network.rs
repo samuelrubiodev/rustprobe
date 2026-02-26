@@ -330,6 +330,7 @@ pub async fn scan_targets(
     while let Some((ip, port, is_open)) = rx.recv().await {
         if is_open {
             found_count += 1;
+            let detection_index = found_count;
 
             if let Some(engine) = &wasm_engine {
                 let reporter_clone = reporter.clone();
@@ -356,7 +357,7 @@ pub async fn scan_targets(
                         }],
                     };
 
-                    reporter_clone.finish_spinner(pb, ip, port, &script_results);
+                    reporter_clone.finish_spinner(pb, detection_index, ip, port, &script_results);
 
                     PortReport {
                         ip,
@@ -367,7 +368,7 @@ pub async fn scan_targets(
                     }
                 });
             } else {
-                reporter.on_open(found_count, ip, port);
+                reporter.on_open(detection_index, ip, port);
                 reports.push(PortReport {
                     ip,
                     port,

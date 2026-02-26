@@ -3,23 +3,27 @@ use crate::services::get_service_name;
 use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+struct OrderedPrintState {
+    next_index: usize,
+    pending: BTreeMap<usize, String>,
+}
 
 struct ReporterInner {
     colors_enabled: bool,
     show_closed_in_live: bool,
     started_at: Instant,
     multi: MultiProgress,
-    open_lines: AtomicUsize,
-    print_lock: Mutex<()>,
+    ordered_print: Mutex<OrderedPrintState>,
 }
 
 #[derive(Clone)]
@@ -34,8 +38,10 @@ impl LiveReporter {
             show_closed_in_live,
             started_at: Instant::now(),
             multi: MultiProgress::new(),
-            open_lines: AtomicUsize::new(0),
-            print_lock: Mutex::new(()),
+            ordered_print: Mutex::new(OrderedPrintState {
+                next_index: 1,
+                pending: BTreeMap::new(),
+            }),
         });
 
         let reporter = Self { inner };
@@ -75,6 +81,7 @@ impl LiveReporter {
     pub fn finish_spinner(
         &self,
         pb: ProgressBar,
+        detection_index: usize,
         ip: IpAddr,
         port: u16,
         script_results: &[ScriptResult],
@@ -91,21 +98,17 @@ impl LiveReporter {
             format!("{service}    Service: {service_details}")
         };
 
-        let _guard = self
-            .inner
-            .print_lock
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let index = self.inner.open_lines.fetch_add(1, Ordering::Relaxed) + 1;
-        self.println(format!(
+        let line = format!(
             "{:>2} {:>9} {:<20} {:>6}/tcp {} {}",
-            index,
+            detection_index,
             format_elapsed(elapsed),
             ip,
             port,
             label,
             final_service
-        ));
+        );
+
+        self.emit_open_line_ordered(detection_index, line);
     }
 
     pub fn println<S: Into<String>>(&self, message: S) {
@@ -117,15 +120,10 @@ impl LiveReporter {
     }
 
     pub fn on_open(&self, index: usize, ip: IpAddr, port: u16) {
-        let _guard = self
-            .inner
-            .print_lock
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         let elapsed = self.elapsed();
         let label = paint("open", "1;32", self.inner.colors_enabled);
         let service = get_service_name(port);
-        self.println(format!(
+        let line = format!(
             "{:>2} {:>9} {:<20} {:>6}/tcp {} {}",
             index,
             format_elapsed(elapsed),
@@ -133,8 +131,8 @@ impl LiveReporter {
             port,
             label,
             service
-        ));
-        self.inner.open_lines.fetch_add(1, Ordering::Relaxed);
+        );
+        self.emit_open_line_ordered(index, line);
     }
 
     pub fn on_closed(&self, index: usize, ip: IpAddr, port: u16) {
@@ -171,6 +169,25 @@ impl LiveReporter {
 
     fn elapsed(&self) -> Duration {
         self.inner.started_at.elapsed()
+    }
+
+    fn emit_open_line_ordered(&self, index: usize, line: String) {
+        let mut state = self
+            .inner
+            .ordered_print
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        state.pending.insert(index, line);
+
+        loop {
+            let next_index = state.next_index;
+            let Some(next_line) = state.pending.remove(&next_index) else {
+                break;
+            };
+            self.println(next_line);
+            state.next_index += 1;
+        }
     }
 }
 
