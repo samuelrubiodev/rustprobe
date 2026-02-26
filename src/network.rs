@@ -6,14 +6,102 @@ use ipnet::IpNet;
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpStream as TokioTcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration as TokioDuration, Instant};
 
 const MAX_CONCURRENCY: usize = 2_048;
+const TARPIT_MIN_SAMPLES: usize = 96;
+const TARPIT_OPEN_MIN: usize = 80;
+const TARPIT_STREAK_MIN: usize = 64;
+const TARPIT_OPEN_RATIO_PERCENT: usize = 85;
 
 pub fn clamp_concurrency(value: usize) -> usize {
     value.min(MAX_CONCURRENCY).max(1)
+}
+
+#[derive(Default)]
+struct IpScanState {
+    samples: AtomicUsize,
+    open_hits: AtomicUsize,
+    open_streak: AtomicUsize,
+    tarpit_detected: AtomicBool,
+}
+
+impl IpScanState {
+    fn should_abort(&self) -> bool {
+        self.tarpit_detected.load(Ordering::Relaxed)
+    }
+
+    fn record_result(&self, is_open: bool) -> bool {
+        let samples = self.samples.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let open_hits = if is_open {
+            self.open_hits.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.open_hits.load(Ordering::Relaxed)
+        };
+
+        let streak = if is_open {
+            self.open_streak.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.open_streak.store(0, Ordering::Relaxed);
+            0
+        };
+
+        if samples < TARPIT_MIN_SAMPLES {
+            return false;
+        }
+
+        let ratio = open_hits.saturating_mul(100) / samples.max(1);
+        let suspicious = open_hits >= TARPIT_OPEN_MIN
+            && streak >= TARPIT_STREAK_MIN
+            && ratio >= TARPIT_OPEN_RATIO_PERCENT;
+
+        if suspicious {
+            return self
+                .tarpit_detected
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+        }
+
+        false
+    }
+}
+
+fn connection_timeout_for_attempt(base_timeout_ms: u64, attempt: u32) -> u64 {
+    let multiplier = 1u64 << attempt.min(3);
+    let timeout_ms = base_timeout_ms.saturating_mul(multiplier);
+    let hard_cap = base_timeout_ms.saturating_mul(6).saturating_add(300);
+    timeout_ms.min(hard_cap)
+}
+
+fn backoff_delay_ms(ip: IpAddr, port: u16, attempt: u32) -> u64 {
+    let base = 40u64;
+    let growth = 1u64 << attempt.min(5);
+    let jitter = deterministic_jitter(ip, port, attempt, 45);
+    base.saturating_mul(growth).saturating_add(jitter).min(1_250)
+}
+
+fn deterministic_jitter(ip: IpAddr, port: u16, attempt: u32, max_jitter_ms: u64) -> u64 {
+    let mut seed = port as u64 ^ ((attempt as u64) << 16);
+
+    match ip {
+        IpAddr::V4(ipv4) => {
+            for octet in ipv4.octets() {
+                seed = seed.rotate_left(5) ^ (octet as u64);
+            }
+        }
+        IpAddr::V6(ipv6) => {
+            for segment in ipv6.segments() {
+                seed = seed.rotate_left(3) ^ (segment as u64);
+            }
+        }
+    }
+
+    seed % (max_jitter_ms.max(1))
 }
 
 pub async fn resolve_targets(target: &str) -> Result<Vec<IpAddr>> {
@@ -93,8 +181,7 @@ pub async fn scan_targets(
     timing: TimingProfile,
     reporter: &LiveReporter,
 ) -> Vec<OpenPort> {
-    let semaphore = Arc::new(Semaphore::new(clamp_concurrency(timing.concurrency)));
-    let mut tasks = FuturesUnordered::new();
+    let worker_count = clamp_concurrency(timing.concurrency);
     let total_checks = targets.len().saturating_mul(ports.len());
 
     let mut rtt_tasks = FuturesUnordered::new();
@@ -110,7 +197,10 @@ pub async fn scan_targets(
                     .saturating_mul(3)
                     .saturating_div(2)
                     .saturating_add(20);
-                let adjusted_timeout = dynamic_timeout.max(timing.timeout_ms);
+                let timeout_cap = timing.timeout_ms.saturating_mul(8).max(1_200);
+                let adjusted_timeout = dynamic_timeout
+                    .max(timing.timeout_ms)
+                    .min(timeout_cap);
                 println!(
                     "[i] Latencia a {ip}: {}ms (timeout {}ms)",
                     rtt.as_millis(),
@@ -124,26 +214,64 @@ pub async fn scan_targets(
         timeout_by_ip.insert(ip, timeout_ms);
     }
 
+    let mut jobs = Vec::with_capacity(total_checks);
     for &ip in targets {
-        let ip_timeout_ms = timeout_by_ip.get(&ip).copied().unwrap_or(timing.timeout_ms);
-
         for &port in ports {
-            let semaphore = Arc::clone(&semaphore);
-            let timeout_ms = ip_timeout_ms;
-            let retries = timing.retries;
+            jobs.push((ip, port));
+        }
+    }
 
-            tasks.push(tokio::spawn(async move {
-                let permit = match semaphore.acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(_) => return (ip, port, false),
+    let job_cursor = Arc::new(AtomicUsize::new(0));
+    let timeout_by_ip = Arc::new(timeout_by_ip);
+    let ip_states: Arc<HashMap<IpAddr, Arc<IpScanState>>> = Arc::new(
+        targets
+            .iter()
+            .copied()
+            .map(|ip| (ip, Arc::new(IpScanState::default())))
+            .collect(),
+    );
+
+    let channel_capacity = worker_count.saturating_mul(4).max(128);
+    let (tx, mut rx) = mpsc::channel::<(IpAddr, u16, bool)>(channel_capacity);
+    let jobs = Arc::new(jobs);
+
+    let mut workers = FuturesUnordered::new();
+    for _ in 0..worker_count {
+        let tx = tx.clone();
+        let job_cursor = Arc::clone(&job_cursor);
+        let jobs = Arc::clone(&jobs);
+        let timeout_by_ip = Arc::clone(&timeout_by_ip);
+        let ip_states = Arc::clone(&ip_states);
+        let retries = timing.retries;
+
+        workers.push(tokio::spawn(async move {
+            loop {
+                let idx = job_cursor.fetch_add(1, Ordering::Relaxed);
+                if idx >= jobs.len() {
+                    break;
+                }
+
+                let (ip, port) = jobs[idx];
+                let ip_state = match ip_states.get(&ip) {
+                    Some(state) => Arc::clone(state),
+                    None => continue,
                 };
 
+                if ip_state.should_abort() {
+                    let _ = tx.send((ip, port, false)).await;
+                    continue;
+                }
+
+                let timeout_ms = timeout_by_ip.get(&ip).copied().unwrap_or(timing.timeout_ms);
                 let addr = SocketAddr::new(ip, port);
                 let mut is_open = false;
 
                 for attempt in 0..=retries {
-                    // Aumento dinámico del timeout por cada reintento
-                    let current_timeout = timeout_ms + (attempt as u64 * 250);
+                    if ip_state.should_abort() {
+                        break;
+                    }
+
+                    let current_timeout = connection_timeout_for_attempt(timeout_ms, attempt);
 
                     let result = timeout(
                         TokioDuration::from_millis(current_timeout),
@@ -151,49 +279,60 @@ pub async fn scan_targets(
                     )
                     .await;
 
-                    match result {
-                        Ok(Ok(stream)) => {
-                            let is_self_connect = match (stream.local_addr(), stream.peer_addr()) {
-                                (Ok(local), Ok(peer)) => local == peer,
-                                _ => false,
-                            };
+                    if let Ok(Ok(mut stream)) = result {
+                        let is_self_connect = match (stream.local_addr(), stream.peer_addr()) {
+                            (Ok(local), Ok(peer)) => local == peer,
+                            _ => false,
+                        };
 
-                            if !is_self_connect {
-                                is_open = true;
-                                break;
-                            }
+                        let _ = stream.shutdown().await;
+
+                        if !is_self_connect {
+                            is_open = true;
+                            break;
                         }
-                        _ => {}
                     }
 
                     if attempt < retries {
-                        // Respiro exponencial para vaciar la cola del router
-                        let sleep_time = 50 + (attempt as u64 * 100);
-                        tokio::time::sleep(TokioDuration::from_millis(sleep_time)).await;
+                        let sleep_ms = backoff_delay_ms(ip, port, attempt);
+                        tokio::time::sleep(TokioDuration::from_millis(sleep_ms)).await;
                     }
                 }
 
-                drop(permit);
+                let tarpit_now = ip_state.record_result(is_open);
+                if tarpit_now {
+                    eprintln!(
+                        "[!] Posible TCP tarpitting detectado en {ip}; abortando puertos restantes para este host."
+                    );
+                }
 
-                (ip, port, is_open)
-            }));
-        }
+                if tx.send((ip, port, is_open)).await.is_err() {
+                    break;
+                }
+            }
+        }));
     }
+
+    drop(tx);
 
     let mut open_ports = Vec::new();
     let mut found_count: usize = 0;
     let mut closed_count: usize = 0;
 
-    while let Some(joined) = tasks.next().await {
-        if let Ok((ip, port, is_open)) = joined {
-            if is_open {
-                found_count += 1;
-                reporter.on_open(found_count, ip, port);
-                open_ports.push(OpenPort { ip, port });
-            } else {
-                closed_count += 1;
-                reporter.on_closed(found_count + closed_count, ip, port);
-            }
+    while let Some((ip, port, is_open)) = rx.recv().await {
+        if is_open {
+            found_count += 1;
+            reporter.on_open(found_count, ip, port);
+            open_ports.push(OpenPort { ip, port });
+        } else {
+            closed_count += 1;
+            reporter.on_closed(found_count + closed_count, ip, port);
+        }
+    }
+
+    while let Some(joined) = workers.next().await {
+        if let Err(error) = joined {
+            eprintln!("[!] Worker de escaneo abortado: {error}");
         }
     }
 
