@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 struct ReporterInner {
@@ -18,6 +19,7 @@ struct ReporterInner {
     started_at: Instant,
     multi: MultiProgress,
     open_lines: AtomicUsize,
+    print_lock: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -33,6 +35,7 @@ impl LiveReporter {
             started_at: Instant::now(),
             multi: MultiProgress::new(),
             open_lines: AtomicUsize::new(0),
+            print_lock: Mutex::new(()),
         });
 
         let reporter = Self { inner };
@@ -79,7 +82,6 @@ impl LiveReporter {
         pb.finish_and_clear();
 
         let elapsed = self.elapsed();
-        let index = self.inner.open_lines.fetch_add(1, Ordering::Relaxed) + 1;
         let label = paint("open", "1;32", self.inner.colors_enabled);
         let service = get_service_name(port);
         let service_details = service_banner(script_results);
@@ -89,6 +91,12 @@ impl LiveReporter {
             format!("{service}    Service: {service_details}")
         };
 
+        let _guard = self
+            .inner
+            .print_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let index = self.inner.open_lines.fetch_add(1, Ordering::Relaxed) + 1;
         self.println(format!(
             "{:>2} {:>9} {:<20} {:>6}/tcp {} {}",
             index,
@@ -109,6 +117,11 @@ impl LiveReporter {
     }
 
     pub fn on_open(&self, index: usize, ip: IpAddr, port: u16) {
+        let _guard = self
+            .inner
+            .print_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let elapsed = self.elapsed();
         let label = paint("open", "1;32", self.inner.colors_enabled);
         let service = get_service_name(port);
@@ -273,7 +286,7 @@ fn service_banner(script_results: &[ScriptResult]) -> String {
             }
 
             if let Some(summary) = value.get("summary").and_then(Value::as_str) {
-                return summary.to_string();
+                return normalized_service_summary(summary);
             }
         }
     }
@@ -310,4 +323,20 @@ fn severity_color_code(severity: &str) -> &'static str {
         "critical" | "high" | "error" => "1;31",
         _ => "1;33",
     }
+}
+
+fn normalized_service_summary(summary: &str) -> String {
+    let mut current = summary.trim();
+
+    loop {
+        let lower = current.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("service:") {
+            let consumed = current.len() - rest.len();
+            current = current[consumed..].trim_start();
+            continue;
+        }
+        break;
+    }
+
+    current.to_string()
 }
