@@ -142,8 +142,11 @@ pub async fn scan_targets(
                 let mut is_open = false;
 
                 for attempt in 0..=retries {
+                    // Aumento dinámico del timeout por cada reintento
+                    let current_timeout = timeout_ms + (attempt as u64 * 250);
+
                     let result = timeout(
-                        TokioDuration::from_millis(timeout_ms),
+                        TokioDuration::from_millis(current_timeout),
                         TokioTcpStream::connect(addr),
                     )
                     .await;
@@ -164,7 +167,9 @@ pub async fn scan_targets(
                     }
 
                     if attempt < retries {
-                        tokio::time::sleep(TokioDuration::from_millis(50)).await;
+                        // Respiro exponencial para vaciar la cola del router
+                        let sleep_time = 50 + (attempt as u64 * 100);
+                        tokio::time::sleep(TokioDuration::from_millis(sleep_time)).await;
                     }
                 }
 
