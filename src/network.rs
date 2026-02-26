@@ -326,7 +326,8 @@ pub async fn scan_targets(
     let mut closed_count: usize = 0;
     let mut script_jobs = JoinSet::new();
     let scan_hostname = hostname.map(|value| value.to_string());
-    let script_semaphore = std::sync::Arc::new(Semaphore::new(15));
+    let script_parallelism = (worker_count / 128).clamp(2, 8);
+    let script_semaphore = std::sync::Arc::new(Semaphore::new(script_parallelism));
 
     while let Some((ip, port, is_open)) = rx.recv().await {
         if is_open {
