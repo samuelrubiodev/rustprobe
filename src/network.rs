@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::task::JoinSet;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpStream as TokioTcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{timeout, Duration as TokioDuration, Instant};
 
 const MAX_CONCURRENCY: usize = 2_048;
@@ -326,6 +326,7 @@ pub async fn scan_targets(
     let mut closed_count: usize = 0;
     let mut script_jobs = JoinSet::new();
     let scan_hostname = hostname.map(|value| value.to_string());
+    let script_semaphore = std::sync::Arc::new(Semaphore::new(5));
 
     while let Some((ip, port, is_open)) = rx.recv().await {
         if is_open {
@@ -333,6 +334,11 @@ pub async fn scan_targets(
             let detection_index = found_count;
 
             if let Some(engine) = &wasm_engine {
+                let permit = script_semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("script semaphore closed");
                 let reporter_clone = reporter.clone();
                 let engine = Arc::clone(engine);
                 let pb = reporter.add_scanning_spinner(ip, port);
@@ -358,6 +364,7 @@ pub async fn scan_targets(
                     };
 
                     reporter_clone.finish_spinner(pb, detection_index, ip, port, &script_results);
+                    drop(permit);
 
                     PortReport {
                         ip,

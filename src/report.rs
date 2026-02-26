@@ -24,6 +24,7 @@ struct ReporterInner {
     started_at: Instant,
     multi: MultiProgress,
     ordered_print: Mutex<OrderedPrintState>,
+    ui_print_lock: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -42,6 +43,7 @@ impl LiveReporter {
                 next_index: 1,
                 pending: BTreeMap::new(),
             }),
+            ui_print_lock: Mutex::new(()),
         });
 
         let reporter = Self { inner };
@@ -112,6 +114,11 @@ impl LiveReporter {
     }
 
     pub fn println<S: Into<String>>(&self, message: S) {
+        let _guard = self
+            .inner
+            .ui_print_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let _ = self.inner.multi.println(message.into());
     }
 

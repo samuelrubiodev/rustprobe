@@ -412,7 +412,7 @@ async fn tcp_exchange_async(
     tls_hostname: String,
 ) -> Result<Vec<u8>> {
     let socket = SocketAddr::new(ip_addr, port);
-    let stream = timeout(Duration::from_secs(2), TokioTcpStream::connect(socket))
+    let stream = timeout(Duration::from_secs(4), TokioTcpStream::connect(socket))
         .await
         .context("Timeout al conectar por TCP")?
         .context("No se pudo conectar por TCP")?;
@@ -476,7 +476,7 @@ where
     let mut temp = [0u8; 4096];
 
     if wait_first_chunk {
-        match timeout(Duration::from_secs(2), stream.read(&mut temp)).await {
+        match timeout(Duration::from_secs(4), stream.read(&mut temp)).await {
             Ok(Ok(0)) => return Ok(response),
             Ok(Ok(n)) => response.extend_from_slice(&temp[..n]),
             Ok(Err(err))
@@ -491,7 +491,7 @@ where
     }
 
     loop {
-        match timeout(Duration::from_secs(2), stream.read(&mut temp)).await {
+        match timeout(Duration::from_secs(4), stream.read(&mut temp)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => response.extend_from_slice(&temp[..n]),
             Ok(Err(err))
