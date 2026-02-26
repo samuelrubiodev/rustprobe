@@ -33,6 +33,8 @@ static MYSQL_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)mysql_native_password|5\.0\.|5\.5\.|8\.0\.").unwrap());
 static IRC_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)NOTICE AUTH|irc").unwrap());
 static SHELL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)root@|# ").unwrap());
+static TITLE_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<title[^>]*>\s*(.*?)\s*</title>").unwrap());
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alloc(len: i32) -> i32 {
@@ -148,6 +150,10 @@ fn extract_signature(response_bytes: &[u8]) -> String {
         return format!("Service: SSH (Banner: {})", trimmed);
     }
 
+    if let Some(http_signature) = extract_http_signature(trimmed) {
+        return http_signature;
+    }
+
     if trimmed.len() >= 3 {
         let prefix_window: String = trimmed.chars().take(40).collect();
         if prefix_window.contains("220 ") {
@@ -171,15 +177,75 @@ fn extract_signature(response_bytes: &[u8]) -> String {
     format!("Unknown: {}", snippet)
 }
 
-fn clean_ascii(raw: &[u8]) -> String {
-    let printable: Vec<u8> = raw
-        .iter()
-        .copied()
-        .filter(|b| (32..=126).contains(b))
-        .collect();
+fn extract_http_signature(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    let status_line = lines.next()?.trim();
+    if !status_line.to_ascii_uppercase().starts_with("HTTP/") {
+        return None;
+    }
 
-    let as_text = String::from_utf8_lossy(&printable).to_string();
-    as_text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut server_header: Option<String> = None;
+    let mut location_header: Option<String> = None;
+
+    for line in lines {
+        let header = line.trim();
+        if header.is_empty() {
+            break;
+        }
+
+        if server_header.is_none() && header.len() >= 7 && header[..7].eq_ignore_ascii_case("Server:") {
+            server_header = Some(header[7..].trim().to_string());
+            continue;
+        }
+
+        if location_header.is_none()
+            && header.len() >= 9
+            && header[..9].eq_ignore_ascii_case("Location:")
+        {
+            location_header = Some(header[9..].trim().to_string());
+        }
+    }
+
+    if let Some(server) = server_header {
+        if server.is_empty() {
+            return Some("HTTP Server: unknown".to_string());
+        }
+        return Some(format!("HTTP Server: {}", server));
+    }
+
+    let status_upper = status_line.to_ascii_uppercase();
+    let is_redirect = status_upper.contains(" 301 ")
+        || status_upper.contains(" 302 ")
+        || status_upper.contains(" 301\t")
+        || status_upper.contains(" 302\t")
+        || status_upper.ends_with(" 301")
+        || status_upper.ends_with(" 302")
+        || status_upper.contains("MOVED PERMANENTLY")
+        || status_upper.contains("FOUND")
+        || status_upper.contains("REDIRECT");
+
+    if is_redirect {
+        if let Some(location) = location_header.filter(|value| !value.is_empty()) {
+            return Some(format!("HTTP Redirect -> {}", location));
+        }
+        return Some("HTTP Redirect".to_string());
+    }
+
+    if let Some(captures) = TITLE_REGEX.captures(text) {
+        let title = captures.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if !title.is_empty() {
+            return Some(format!("HTTP Title: {}", title));
+        }
+    }
+
+    Some("HTTP Service (Unknown/Hidden)".to_string())
+}
+
+fn clean_ascii(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .chars()
+        .filter(|ch| *ch != '\0' && ch.is_ascii() && (ch.is_ascii_graphic() || ch.is_ascii_whitespace()))
+        .collect()
 }
 
 fn serialize_output(summary: &str) -> String {

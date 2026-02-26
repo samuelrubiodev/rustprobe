@@ -417,6 +417,8 @@ async fn tcp_exchange_async(
         .context("Timeout al conectar por TCP")?
         .context("No se pudo conectar por TCP")?;
 
+    let is_null_probe = payload.as_ref().map_or(true, |data| data.is_empty());
+
     if use_tls {
         let mut builder = native_tls::TlsConnector::builder();
         builder.danger_accept_invalid_certs(true);
@@ -438,12 +440,12 @@ async fn tcp_exchange_async(
             .context("Handshake TLS fallido")?;
 
         write_payload_if_any(&mut tls_stream, payload.as_deref()).await?;
-        return read_response_with_timeout(&mut tls_stream).await;
+        return read_response_with_timeout(&mut tls_stream, is_null_probe).await;
     }
 
     let mut tcp_stream = stream;
     write_payload_if_any(&mut tcp_stream, payload.as_deref()).await?;
-    read_response_with_timeout(&mut tcp_stream).await
+    read_response_with_timeout(&mut tcp_stream, is_null_probe).await
 }
 
 async fn write_payload_if_any<S>(stream: &mut S, payload: Option<&[u8]>) -> Result<()>
@@ -466,12 +468,27 @@ where
     Ok(())
 }
 
-async fn read_response_with_timeout<S>(stream: &mut S) -> Result<Vec<u8>>
+async fn read_response_with_timeout<S>(stream: &mut S, wait_first_chunk: bool) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {
     let mut response = Vec::new();
     let mut temp = [0u8; 4096];
+
+    if wait_first_chunk {
+        match timeout(Duration::from_secs(2), stream.read(&mut temp)).await {
+            Ok(Ok(0)) => return Ok(response),
+            Ok(Ok(n)) => response.extend_from_slice(&temp[..n]),
+            Ok(Err(err))
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                return Ok(response);
+            }
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => return Ok(response),
+        }
+    }
 
     loop {
         match timeout(Duration::from_secs(2), stream.read(&mut temp)).await {
