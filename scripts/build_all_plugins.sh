@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET_TRIPLE="wasm32-wasip1"
+TARGET_TRIPLE="${RUSTPROBE_WASM_TARGET:-wasm32-unknown-unknown}"
 RUNTIME_SCRIPTS_DIR="${RUSTPROBE_SCRIPTS_DIR:-}"
 
 if [[ -z "$RUNTIME_SCRIPTS_DIR" ]]; then
