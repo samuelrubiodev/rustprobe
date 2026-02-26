@@ -474,14 +474,15 @@ where
 {
     let mut response = Vec::new();
     let mut temp = [0u8; 4096];
-    let read_timeout = if wait_first_chunk {
-        Duration::from_secs(3)
+    let first_chunk_timeout = if wait_first_chunk {
+        Duration::from_secs(4)
     } else {
-        Duration::from_millis(1_500)
+        Duration::from_millis(3_000)
     };
+    let chunk_timeout = Duration::from_millis(3_000);
 
     if wait_first_chunk {
-        match timeout(read_timeout, stream.read(&mut temp)).await {
+        match timeout(first_chunk_timeout, stream.read(&mut temp)).await {
             Ok(Ok(0)) => return Ok(response),
             Ok(Ok(n)) => response.extend_from_slice(&temp[..n]),
             Ok(Err(err))
@@ -496,7 +497,7 @@ where
     }
 
     loop {
-        match timeout(read_timeout, stream.read(&mut temp)).await {
+        match timeout(chunk_timeout, stream.read(&mut temp)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => response.extend_from_slice(&temp[..n]),
             Ok(Err(err))
