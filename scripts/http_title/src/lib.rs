@@ -14,7 +14,14 @@ struct WasmScanOutput {
 }
 
 unsafe extern "C" {
-    fn host_send_tcp(ip_ptr: i32, ip_len: i32, port: i32, payload_ptr: i32, payload_len: i32) -> i64;
+    fn host_send_tcp(
+        ip_ptr: i32,
+        ip_len: i32,
+        port: i32,
+        payload_ptr: i32,
+        payload_len: i32,
+        use_tls: i32,
+    ) -> i64;
 }
 
 #[unsafe(no_mangle)]
@@ -58,12 +65,14 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
 
             let request_bytes = request.as_bytes();
             let packed_response = unsafe {
+                let use_tls = if input.port == 443 || input.port == 8443 { 1 } else { 0 };
                 host_send_tcp(
                     input.ip.as_ptr() as i32,
                     input.ip.len() as i32,
                     input.port as i32,
                     request_bytes.as_ptr() as i32,
                     request_bytes.len() as i32,
+                    use_tls,
                 )
             } as u64;
 

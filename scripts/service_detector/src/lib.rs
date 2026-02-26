@@ -14,7 +14,14 @@ struct WasmScanOutput {
 }
 
 unsafe extern "C" {
-    fn host_send_tcp(ip_ptr: i32, ip_len: i32, port: i32, payload_ptr: i32, payload_len: i32) -> i64;
+    fn host_send_tcp(
+        ip_ptr: *const u8,
+        ip_len: usize,
+        port: u16,
+        payload_ptr: *const u8,
+        payload_len: usize,
+        use_tls: i32,
+    ) -> i64;
 }
 
 #[unsafe(no_mangle)]
@@ -51,17 +58,25 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
 
     let output_text = match parsed {
         Ok(input) => {
-            let payload = format!(
-                "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-                input.ip
-            );
+            let payload = if input.port == 21 || input.port == 22 {
+                Vec::new()
+            } else {
+                format!(
+                    "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+                    input.ip
+                )
+                .into_bytes()
+            };
+
+            let use_tls = if input.port == 443 || input.port == 8443 { 1 } else { 0 };
             let packed_response = unsafe {
                 host_send_tcp(
-                    input.ip.as_ptr() as i32,
-                    input.ip.len() as i32,
-                    input.port as i32,
-                    payload.as_ptr() as i32,
-                    payload.len() as i32,
+                    input.ip.as_ptr(),
+                    input.ip.len(),
+                    input.port,
+                    payload.as_ptr(),
+                    payload.len(),
+                    use_tls,
                 )
             } as u64;
 
@@ -100,35 +115,37 @@ fn extract_signature(response_bytes: &[u8]) -> String {
         return "No response".to_string();
     }
 
-    if trimmed.contains("HTTP/1.") {
-        let server_line = trimmed
-            .split(['\r', '\n'])
-            .map(str::trim)
-            .find(|line| line.to_ascii_lowercase().starts_with("server:"));
-
-        if let Some(line) = server_line {
-            let value = line
-                .split_once(':')
-                .map(|(_, right)| right.trim())
-                .unwrap_or(line);
-            if !value.is_empty() {
-                return format!("Service: {}", value);
-            }
-            return format!("Service: {}", line);
-        }
-    }
-
     let first_line = trimmed
         .split(['\r', '\n'])
         .next()
         .unwrap_or("")
         .trim();
 
+    if trimmed.contains("HTTP/1.") {
+        let server_line = trimmed
+            .split(['\r', '\n'])
+            .map(str::trim)
+            .find(|line| line.to_ascii_lowercase().starts_with("server: "));
+
+        if let Some(line) = server_line {
+            let value = line
+                .split_once(':')
+                .map(|(_, right)| right.trim())
+                .unwrap_or("");
+            if !value.is_empty() {
+                return format!("Service: {}", value);
+            }
+            return "HTTP Service (No Server Header)".to_string();
+        }
+
+        return "HTTP Service (No Server Header)".to_string();
+    }
+
     if first_line.starts_with("SSH-") {
         return format!("Service: {}", first_line);
     }
 
-    if first_line.starts_with("220 ") {
+    if trimmed.contains("220 ") {
         return first_line.to_string();
     }
 
@@ -146,9 +163,9 @@ fn extract_signature(response_bytes: &[u8]) -> String {
         .collect();
 
     let compact = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let snippet: String = compact.chars().take(50).collect();
+    let snippet: String = compact.chars().take(40).collect();
 
-    format!("Unknown Protocol: {}", snippet)
+    format!("Unknown: {}", snippet)
 }
 
 fn serialize_output(summary: &str) -> String {

@@ -158,15 +158,16 @@ Salida de analyze:
 
 El host exporta al plugin:
 
-- env.host_send_tcp(ip_ptr, ip_len, port, payload_ptr, payload_len) -> i64
+- env.host_send_tcp(ip_ptr, ip_len, port, payload_ptr, payload_len, use_tls) -> i64
 
 Contrato:
 
 1. Guest pasa IP y payload como puntero+longitud en memoria Wasm.
 2. Host valida rangos de memoria.
-3. Host abre TCP sincrónico con timeout (2s), envía payload y lee respuesta.
-4. Host reserva buffer en guest llamando alloc(len), escribe respuesta y retorna ptr/len empaquetado.
-5. Guest copia respuesta y llama dealloc(ptr,len) para liberar.
+3. Host abre TCP con timeout (2s); si use_tls=1, envuelve el stream en TLS y acepta certificados/hostnames inválidos.
+4. Si payload_ptr<=0 o payload_len==0, host entra en modo "solo escucha" (no escribe, solo lee banner/respuesta).
+5. Host reserva buffer en guest llamando alloc(len), escribe respuesta y retorna ptr/len empaquetado.
+6. Guest copia respuesta y llama dealloc(ptr,len) para liberar.
 
 Si falla conexión/lectura o hay error de ABI, retorna 0.
 

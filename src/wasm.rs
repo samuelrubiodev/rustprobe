@@ -1,11 +1,13 @@
 use crate::models::{ScriptResult, WasmScanInput};
 use anyhow::{anyhow, bail, Context, Result};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream as TokioTcpStream;
+use tokio::time::{timeout, Duration};
+use tokio_native_tls::{native_tls, TlsConnector};
 use std::fs;
-use std::io::{Read, Write};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::time::Duration;
 use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
 pub struct WasmEngine {
@@ -217,8 +219,9 @@ fn host_send_tcp(
     port: i32,
     payload_ptr: i32,
     payload_len: i32,
+    use_tls: i32,
 ) -> i64 {
-    if ip_ptr <= 0 || ip_len <= 0 || payload_ptr <= 0 || payload_len <= 0 {
+    if ip_ptr <= 0 || ip_len <= 0 {
         return 0;
     }
 
@@ -235,11 +238,17 @@ fn host_send_tcp(
     let Ok(ip_size) = usize::try_from(ip_len) else {
         return 0;
     };
-    let Ok(payload_offset) = usize::try_from(payload_ptr) else {
-        return 0;
-    };
-    let Ok(payload_size) = usize::try_from(payload_len) else {
-        return 0;
+    let has_payload = payload_ptr > 0 && payload_len > 0;
+    let payload_bounds = if has_payload {
+        let Ok(payload_offset) = usize::try_from(payload_ptr) else {
+            return 0;
+        };
+        let Ok(payload_size) = usize::try_from(payload_len) else {
+            return 0;
+        };
+        Some((payload_offset, payload_size))
+    } else {
+        None
     };
 
     let memory_size = memory.data_size(&caller);
@@ -249,12 +258,7 @@ fn host_send_tcp(
         _ => return 0,
     };
 
-    let payload_end = match payload_offset.checked_add(payload_size) {
-        Some(end) if end <= memory_size => end,
-        _ => return 0,
-    };
-
-    if ip_end == ip_offset || payload_end == payload_offset {
+    if ip_end == ip_offset {
         return 0;
     }
 
@@ -263,10 +267,24 @@ fn host_send_tcp(
         return 0;
     }
 
-    let mut payload = vec![0u8; payload_size];
-    if memory.read(&caller, payload_offset, &mut payload).is_err() {
-        return 0;
-    }
+    let payload = if let Some((payload_offset, payload_size)) = payload_bounds {
+        let payload_end = match payload_offset.checked_add(payload_size) {
+            Some(end) if end <= memory_size => end,
+            _ => return 0,
+        };
+
+        if payload_end == payload_offset {
+            None
+        } else {
+            let mut payload = vec![0u8; payload_size];
+            if memory.read(&caller, payload_offset, &mut payload).is_err() {
+                return 0;
+            }
+            Some(payload)
+        }
+    } else {
+        None
+    };
 
     let ip_text = match std::str::from_utf8(&ip_bytes) {
         Ok(text) => text,
@@ -283,35 +301,10 @@ fn host_send_tcp(
         _ => return 0,
     };
 
-    let socket = SocketAddr::new(ip_addr, port_u16);
-    let mut stream = match TcpStream::connect_timeout(&socket, Duration::from_secs(2)) {
-        Ok(stream) => stream,
+    let response = match run_tcp_exchange(ip_addr, port_u16, payload, use_tls == 1) {
+        Ok(response) => response,
         Err(_) => return 0,
     };
-
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-
-    if stream.write_all(&payload).is_err() {
-        return 0;
-    }
-
-    let mut response = Vec::new();
-    let mut temp = [0u8; 4096];
-
-    loop {
-        match stream.read(&mut temp) {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&temp[..n]),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                break;
-            }
-            Err(_) => return 0,
-        }
-    }
 
     if response.is_empty() {
         return 0;
@@ -357,6 +350,110 @@ fn host_send_tcp(
     }
 
     pack_ptr_len(out_ptr, out_len)
+}
+
+fn run_tcp_exchange(
+    ip_addr: IpAddr,
+    port: u16,
+    payload: Option<Vec<u8>>,
+    use_tls: bool,
+) -> Result<Vec<u8>> {
+    let join = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .context("No se pudo inicializar runtime Tokio")?;
+
+        runtime.block_on(tcp_exchange_async(ip_addr, port, payload, use_tls))
+    });
+
+    match join.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("Error interno al ejecutar intercambio TCP/TLS")),
+    }
+}
+
+async fn tcp_exchange_async(
+    ip_addr: IpAddr,
+    port: u16,
+    payload: Option<Vec<u8>>,
+    use_tls: bool,
+) -> Result<Vec<u8>> {
+    let socket = SocketAddr::new(ip_addr, port);
+    let stream = timeout(Duration::from_secs(2), TokioTcpStream::connect(socket))
+        .await
+        .context("Timeout al conectar por TCP")?
+        .context("No se pudo conectar por TCP")?;
+
+    if use_tls {
+        let mut builder = native_tls::TlsConnector::builder();
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+
+        let connector = builder
+            .build()
+            .context("No se pudo crear conector TLS")?;
+        let connector = TlsConnector::from(connector);
+        let domain = ip_addr.to_string();
+
+        let mut tls_stream = timeout(Duration::from_secs(3), connector.connect(&domain, stream))
+            .await
+            .context("Timeout durante handshake TLS")?
+            .context("Handshake TLS fallido")?;
+
+        write_payload_if_any(&mut tls_stream, payload.as_deref()).await?;
+        return read_response_with_timeout(&mut tls_stream).await;
+    }
+
+    let mut tcp_stream = stream;
+    write_payload_if_any(&mut tcp_stream, payload.as_deref()).await?;
+    read_response_with_timeout(&mut tcp_stream).await
+}
+
+async fn write_payload_if_any<S>(stream: &mut S, payload: Option<&[u8]>) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(data) = payload else {
+        return Ok(());
+    };
+
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    timeout(Duration::from_secs(2), stream.write_all(data))
+        .await
+        .context("Timeout al escribir payload")?
+        .context("No se pudo enviar payload")?;
+
+    Ok(())
+}
+
+async fn read_response_with_timeout<S>(stream: &mut S) -> Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut response = Vec::new();
+    let mut temp = [0u8; 4096];
+
+    loop {
+        match timeout(Duration::from_secs(2), stream.read(&mut temp)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => response.extend_from_slice(&temp[..n]),
+            Ok(Err(err))
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                break;
+            }
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => break,
+        }
+    }
+
+    Ok(response)
 }
 
 fn pack_ptr_len(ptr: i32, len: i32) -> i64 {
