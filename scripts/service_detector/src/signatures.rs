@@ -25,7 +25,7 @@ lazy_static! {
         },
         Signature {
             service: "MySQL",
-            regex: Regex::new(r"(?is)(?:mysql_native_password|mariadb|(?P<version>\d+\.\d+\.\d+[a-zA-Z0-9.\-]+).*?)")
+            regex: Regex::new(r"(?is)(?:mysql_native_password|mariadb|(?:^|\n)(?P<version>\d+\.\d+\.\d+[a-zA-Z0-9.\-]+)(?:\u{fffd}|[\x01-\x08\x0b-\x1f]).*)")
                 .expect("invalid MySQL signature regex"),
         },
         Signature {
@@ -45,7 +45,7 @@ lazy_static! {
         },
         Signature {
             service: "Telnet (Unauthenticated)",
-            regex: Regex::new(r"(?im)(?:^\xff\xfd|Login:|password:|Escape character is)")
+            regex: Regex::new(r"(?im)(?:^\u{fffd}{2,}|^[\x01-\x1f]{2,}|Login:|password:|Escape character is)")
                 .expect("invalid Telnet (Unauthenticated) signature regex"),
         },
         Signature {
