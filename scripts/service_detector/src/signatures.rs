@@ -25,7 +25,7 @@ lazy_static! {
         },
         Signature {
             service: "MySQL",
-            regex: Regex::new(r"(?is)(?:mysql_native_password|mariadb|(?:^|\n)(?P<version>\d+\.\d+\.\d+[a-zA-Z0-9.\-]+)(?:\u{fffd}|[\x01-\x08\x0b-\x1f]).*)")
+            regex: Regex::new(r"(?is)(?:mysql_native_password|mariadb|(?:^|\n)(?P<version>\d+\.\d+\.\d+[a-zA-Z0-9.\-]+)(?:\u{fffd}|[\x01-\x08\x0b-\x1f]))")
                 .expect("invalid MySQL signature regex"),
         },
         Signature {
@@ -44,11 +44,6 @@ lazy_static! {
                 .expect("invalid IRC signature regex"),
         },
         Signature {
-            service: "Telnet (Unauthenticated)",
-            regex: Regex::new(r"(?im)(?:^\u{fffd}{2,}|^[\x01-\x1f]{2,}|Login:|password:|Escape character is)")
-                .expect("invalid Telnet (Unauthenticated) signature regex"),
-        },
-        Signature {
             service: "Apache",
             regex: Regex::new(r"(?im)^Server:\s*Apache(?:/(?P<version>[\w.\-]+))?")
                 .expect("invalid Apache signature regex"),
@@ -62,6 +57,11 @@ lazy_static! {
             service: "Tomcat",
             regex: Regex::new(r"(?im)(?:^Server:\s*Apache-Coyote(?:/(?P<version>[\w.\-]+))?|tomcat)")
                 .expect("invalid Tomcat signature regex"),
+        },
+        Signature {
+            service: "Telnet (Unauthenticated)",
+            regex: Regex::new(r"(?im)(?:^\u{fffd}{2,}\s*$|^[\x01-\x1f]{2,}\s*$|^\s*login:\s*$|^\s*password:\s*$|^\s*Escape character is)")
+                .expect("invalid Telnet (Unauthenticated) signature regex"),
         },
         Signature {
             service: "Bindshell",
