@@ -1,5 +1,5 @@
 [package]
-name = "banner_grabber"
+name = "service_detector"
 version = "0.1.0"
 edition = "2021"
 
