@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use regex::Regex;
 
 #[derive(Debug, Deserialize)]
 struct WasmScanInput {
@@ -121,7 +122,9 @@ fn extract_signature(response_bytes: &[u8]) -> String {
         .unwrap_or("")
         .trim();
 
-    if trimmed.contains("HTTP/1.") {
+    let is_http_response = trimmed.contains("HTTP/1.");
+
+    if is_http_response {
         let server_line = trimmed
             .split(['\r', '\n'])
             .map(str::trim)
@@ -135,10 +138,7 @@ fn extract_signature(response_bytes: &[u8]) -> String {
             if !value.is_empty() {
                 return format!("Service: {}", value);
             }
-            return "HTTP Service (No Server Header)".to_string();
         }
-
-        return "HTTP Service (No Server Header)".to_string();
     }
 
     if first_line.starts_with("SSH-") {
@@ -147,6 +147,35 @@ fn extract_signature(response_bytes: &[u8]) -> String {
 
     if trimmed.contains("220 ") {
         return first_line.to_string();
+    }
+
+    let signatures = [
+        (
+            r"(?i)no available server",
+            "Golang net/http server (404/503)",
+        ),
+        (r"(?i)<title>Apache Tomcat.*</title>", "Apache Tomcat"),
+    ];
+
+    for (pattern, service) in signatures {
+        if let Ok(regex) = Regex::new(pattern) {
+            if regex.is_match(trimmed) {
+                return format!("Service: {}", service);
+            }
+        }
+    }
+
+    if is_http_response {
+        if let Ok(title_regex) = Regex::new(r"(?i)<title>(.*?)</title>") {
+            if let Some(captures) = title_regex.captures(trimmed) {
+                if let Some(title_match) = captures.get(1) {
+                    let title = title_match.as_str().trim();
+                    if !title.is_empty() {
+                        return format!("HTTP Service (Title: {})", title);
+                    }
+                }
+            }
+        }
     }
 
     let cleaned: String = trimmed
@@ -164,6 +193,13 @@ fn extract_signature(response_bytes: &[u8]) -> String {
 
     let compact = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let snippet: String = compact.chars().take(40).collect();
+
+    if is_http_response {
+        if snippet.is_empty() {
+            return "HTTP Service (Unknown/Hidden)".to_string();
+        }
+        return format!("HTTP Service (Unknown/Hidden): {}", snippet);
+    }
 
     format!("Unknown: {}", snippet)
 }

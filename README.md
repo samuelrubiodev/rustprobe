@@ -17,7 +17,8 @@ RustProbe es un escáner de red de alto rendimiento en Rust, orientado a arquite
 - Muestra puertos cerrados en rojo cuando el usuario define puertos explícitos (por ejemplo -p 80,443,90).
 - Mantiene resumen final con abiertos/cerrados/comprobaciones.
 - Soporta plugins Wasm con importación de función host_send_tcp.
-- Plugin de ejemplo hace petición HTTP y extrae el header Server.
+- Incluye plugins Wasm de referencia listos para usar: `sample_plugin`, `http_title` y `service_detector`.
+- `service_detector` aplica fingerprinting básico (Server, SSH, 220), firmas regex y extracción de `<title>` para servicios HTTP con cabeceras ocultas.
 
 ---
 
@@ -43,10 +44,17 @@ cargo build
 Para compilar el plugin de ejemplo:
 
 ```powershell
-./scripts/build_sample_plugin.ps1
+./scripts/build_all_plugins.ps1
 ```
 
-Esto genera scripts/sample_plugin.wasm.
+Esto compila todos los plugins dentro de `scripts/*/Cargo.toml`, genera los `.wasm` en `scripts/` y los despliega al directorio runtime estándar (`data_dir()/scripts`).
+
+En Linux/macOS:
+
+```bash
+chmod +x ./scripts/build_all_plugins.sh
+./scripts/build_all_plugins.sh
+```
 
 ---
 
@@ -69,7 +77,7 @@ Opciones principales:
 - target: IP, rango IPv4, CIDR o dominio.
 - -p, --ports: lista, rango o - para todos.
 - -T, --timing: T1..T5.
-- --script: nombre(s) de script Wasm (ej. `--script smb,http`).
+- --script: nombre(s) de script Wasm (ej. `--script sample_plugin,http_title`).
 	- Los nombres se resuelven en el directorio local estándar del usuario en `data_dir()/scripts`.
 	- Ejemplos típicos: Linux `~/.local/share/rustprobe/scripts`, Windows `%APPDATA%\rustprobe\scripts`.
 - -C, --default-scripts: ejecuta todos los scripts Wasm del directorio local estándar (opt-in, equivalente a Nmap `-sC`).
@@ -81,9 +89,10 @@ Ejemplos:
 ```powershell
 cargo run -- 127.0.0.1 -p 80,443,90 -T T3
 cargo run -- 192.0.2.10-192.0.2.20 -p 1-1024 -oN ./scan.txt
-cargo run -- 127.0.0.1 -p 80,443 --script smb
-cargo run -- example.com -p 80,443 --script smb,http
+cargo run -- 127.0.0.1 -p 80,443 --script service_detector
+cargo run -- example.com -p 80,443 --script sample_plugin,http_title
 cargo run -- 127.0.0.1 -p 80,443 -C
+cargo run -- --update
 cargo run -- 127.0.0.1 -p 80,443
 ```
 
@@ -173,17 +182,19 @@ Si falla conexión/lectura o hay error de ABI, retorna 0.
 
 ---
 
-## Plugin de ejemplo
+## Plugins Wasm incluidos
 
-Código: [scripts/sample_plugin/src/lib.rs](scripts/sample_plugin/src/lib.rs)
+Código:
 
-Qué hace actualmente:
+- [scripts/sample_plugin/src/lib.rs](scripts/sample_plugin/src/lib.rs)
+- [scripts/http_title/src/lib.rs](scripts/http_title/src/lib.rs)
+- [scripts/service_detector/src/lib.rs](scripts/service_detector/src/lib.rs)
 
-- Importa host_send_tcp.
-- Construye GET / HTTP/1.1.
-- Envía petición al target:puerto descubierto.
-- Parsea cabeceras HTTP y extrae Server.
-- Devuelve JSON con plugin, summary, server y severity.
+Qué hace cada plugin:
+
+- `sample_plugin`: petición HTTP básica y extracción de cabecera `Server`.
+- `http_title`: detección de respuesta HTTP y extracción de etiqueta `<title>`.
+- `service_detector`: identificación de servicio por headers/banners, firmas regex (incluyendo Golang y Tomcat) y fallback `HTTP Service (Unknown/Hidden)` con snippet limpio.
 
 ---
 
@@ -191,7 +202,10 @@ Qué hace actualmente:
 
 - [src/main.rs](src/main.rs): CLI, escaneo, Wasm runtime, salida.
 - [scripts/sample_plugin](scripts/sample_plugin): plugin Wasm de referencia.
-- [scripts/build_sample_plugin.ps1](scripts/build_sample_plugin.ps1): build del plugin.
+- [scripts/http_title](scripts/http_title): plugin Wasm para extraer títulos web.
+- [scripts/service_detector](scripts/service_detector): plugin Wasm para fingerprinting de servicios.
+- [scripts/build_all_plugins.ps1](scripts/build_all_plugins.ps1): build paralelo de todos los plugins Wasm (Windows).
+- [scripts/build_all_plugins.sh](scripts/build_all_plugins.sh): build paralelo de todos los plugins Wasm (Linux/macOS).
 - [scripts/README.md](scripts/README.md): notas adicionales de scripts.
 
 ---

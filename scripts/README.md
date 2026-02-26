@@ -42,7 +42,7 @@ chmod +x ./scripts/build_all_plugins.sh
 
 Notas:
 
-- `--script` recibe nombres separados por coma (ej. `--script smb,http`).
+- `--script` recibe nombres separados por coma (ej. `--script sample_plugin,http_title`).
 - Los nombres se buscan en el directorio local estándar (`data_dir()/scripts`).
 - Puedes sobreescribir el destino runtime con la variable `RUSTPROBE_SCRIPTS_DIR`.
 
