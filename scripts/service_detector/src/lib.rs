@@ -59,14 +59,13 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
 
     let output_text = match parsed {
         Ok(input) => {
-            let payload = if input.port == 21 || input.port == 22 {
-                Vec::new()
-            } else {
-                format!(
-                    "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            let payload = match input.port {
+                21 | 22 | 23 | 25 | 110 | 143 | 2121 | 3306 | 5432 | 5900 | 6667 | 6697 | 1524 => Vec::new(),
+                80 | 443 | 8000 | 8080 | 8443 | _ => format!(
+                    "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
                     input.ip
                 )
-                .into_bytes()
+                .into_bytes(),
             };
 
             let use_tls = if input.port == 443 || input.port == 8443 { 1 } else { 0 };
@@ -109,8 +108,8 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
 }
 
 fn extract_signature(response_bytes: &[u8]) -> String {
-    let response_text = String::from_utf8_lossy(response_bytes);
-    let trimmed = response_text.trim();
+    let cleaned = clean_ascii(response_bytes);
+    let trimmed = cleaned.trim();
 
     if trimmed.is_empty() {
         return "No response".to_string();
@@ -122,86 +121,52 @@ fn extract_signature(response_bytes: &[u8]) -> String {
         .unwrap_or("")
         .trim();
 
-    let is_http_response = trimmed.contains("HTTP/1.");
-
-    if is_http_response {
-        let server_line = trimmed
-            .split(['\r', '\n'])
-            .map(str::trim)
-            .find(|line| line.to_ascii_lowercase().starts_with("server: "));
-
-        if let Some(line) = server_line {
-            let value = line
-                .split_once(':')
-                .map(|(_, right)| right.trim())
-                .unwrap_or("");
-            if !value.is_empty() {
-                return format!("Service: {}", value);
-            }
-        }
+    if first_line.starts_with("RFB") {
+        return format!("Service: VNC (Banner: {})", trimmed);
     }
 
     if first_line.starts_with("SSH-") {
-        return format!("Service: {}", first_line);
+        return format!("Service: SSH (Banner: {})", trimmed);
     }
 
-    if trimmed.contains("220 ") {
-        return first_line.to_string();
-    }
-
-    let signatures = [
-        (
-            r"(?i)no available server",
-            "Golang net/http server (404/503)",
-        ),
-        (r"(?i)<title>Apache Tomcat.*</title>", "Apache Tomcat"),
-    ];
-
-    for (pattern, service) in signatures {
-        if let Ok(regex) = Regex::new(pattern) {
-            if regex.is_match(trimmed) {
-                return format!("Service: {}", service);
-            }
+    if trimmed.len() >= 3 {
+        let prefix_window: String = trimmed.chars().take(40).collect();
+        if prefix_window.contains("220 ") {
+            return format!("Service: FTP/SMTP (Banner: {})", trimmed);
         }
     }
 
-    if is_http_response {
-        if let Ok(title_regex) = Regex::new(r"(?i)<title>(.*?)</title>") {
-            if let Some(captures) = title_regex.captures(trimmed) {
-                if let Some(title_match) = captures.get(1) {
-                    let title = title_match.as_str().trim();
-                    if !title.is_empty() {
-                        return format!("HTTP Service (Title: {})", title);
-                    }
-                }
-            }
+    if let Ok(mysql_regex) = Regex::new(r"(?i)mysql_native_password|5\.0\.|5\.5\.|8\.0\.") {
+        if mysql_regex.is_match(trimmed) {
+            return format!("Service: MySQL (Banner: {})", trimmed);
         }
     }
 
-    let cleaned: String = trimmed
-        .chars()
-        .filter_map(|character| {
-            if character == '\0' {
-                None
-            } else if character.is_control() {
-                Some(' ')
-            } else {
-                Some(character)
-            }
-        })
+    if let Ok(irc_regex) = Regex::new(r"(?i)NOTICE AUTH|irc") {
+        if irc_regex.is_match(trimmed) {
+            return format!("Service: IRC (Banner: {})", trimmed);
+        }
+    }
+
+    if let Ok(shell_regex) = Regex::new(r"(?i)root@|# ") {
+        if shell_regex.is_match(trimmed) {
+            return format!("Service: Bindshell/Telnet (Banner: {})", trimmed);
+        }
+    }
+
+    let snippet: String = trimmed.chars().take(50).collect();
+    format!("Unknown: {}", snippet)
+}
+
+fn clean_ascii(raw: &[u8]) -> String {
+    let printable: Vec<u8> = raw
+        .iter()
+        .copied()
+        .filter(|b| (32..=126).contains(b))
         .collect();
 
-    let compact = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let snippet: String = compact.chars().take(40).collect();
-
-    if is_http_response {
-        if snippet.is_empty() {
-            return "HTTP Service (Unknown/Hidden)".to_string();
-        }
-        return format!("HTTP Service (Unknown/Hidden): {}", snippet);
-    }
-
-    format!("Unknown: {}", snippet)
+    let as_text = String::from_utf8_lossy(&printable).to_string();
+    as_text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn serialize_output(summary: &str) -> String {
