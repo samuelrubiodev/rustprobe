@@ -45,6 +45,7 @@ Notas:
 - `--script` recibe nombres separados por coma (ej. `--script sample_plugin,http_title`).
 - Los nombres se buscan en el directorio local estándar (`data_dir()/scripts`).
 - Puedes sobreescribir el destino runtime con la variable `RUSTPROBE_SCRIPTS_DIR`.
+- El target de compilación por defecto es `wasm32-unknown-unknown` (compatible con el runtime actual de RustProbe, sin WASI). Puedes sobreescribirlo con `RUSTPROBE_WASM_TARGET`.
 
 ## ABI esperada por el host
 

@@ -1,10 +1,13 @@
 use serde::{Deserialize, Serialize};
-use regex::Regex;
+
+mod probes;
+mod signatures;
 
 #[derive(Debug, Deserialize)]
 struct WasmScanInput {
     ip: String,
     port: u16,
+    hostname: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -16,14 +19,17 @@ struct WasmScanOutput {
 
 unsafe extern "C" {
     fn host_send_tcp(
-        ip_ptr: *const u8,
-        ip_len: usize,
-        port: u16,
-        payload_ptr: *const u8,
-        payload_len: usize,
+        ip_ptr: i32,
+        ip_len: i32,
+        port: i32,
+        payload_ptr: i32,
+        payload_len: i32,
         use_tls: i32,
+        host_ptr: i32,
+        host_len: i32,
     ) -> i64;
 }
+
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alloc(len: i32) -> i32 {
@@ -59,45 +65,36 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
 
     let output_text = match parsed {
         Ok(input) => {
-            let payload = if input.port == 21 || input.port == 22 {
-                Vec::new()
-            } else {
-                format!(
-                    "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-                    input.ip
-                )
-                .into_bytes()
-            };
+            let hostname = input
+                .hostname
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(input.ip.as_str())
+                .to_string();
 
-            let use_tls = if input.port == 443 || input.port == 8443 { 1 } else { 0 };
-            let packed_response = unsafe {
-                host_send_tcp(
-                    input.ip.as_ptr(),
-                    input.ip.len(),
+            let probe_queue = probes::build_probe_queue(input.port, &hostname);
+            let mut selected_banner: Option<String> = None;
+
+            for probe in probe_queue {
+                let _probe_name = probe.name;
+                if let Some(response_bytes) = send_probe(
+                    &input.ip,
                     input.port,
-                    payload.as_ptr(),
-                    payload.len(),
-                    use_tls,
-                )
-            } as u64;
-
-            let summary = if packed_response == 0 {
-                "No response".to_string()
-            } else {
-                let response_ptr = (packed_response >> 32) as u32 as i32;
-                let response_len = (packed_response & 0xFFFF_FFFF) as u32 as i32;
-
-                if response_ptr <= 0 || response_len <= 0 {
-                    "No response".to_string()
-                } else {
-                    let response_slice =
-                        unsafe { std::slice::from_raw_parts(response_ptr as *const u8, response_len as usize) };
-                    let response_bytes = response_slice.to_vec();
-
-                    dealloc(response_ptr, response_len);
-
-                    extract_signature(&response_bytes)
+                    &probe.payload,
+                    probe.use_tls,
+                    &hostname,
+                ) {
+                    if !response_bytes.is_empty() {
+                        selected_banner = Some(String::from_utf8_lossy(&response_bytes).replace('\0', ""));
+                        break;
+                    }
                 }
+            }
+
+            let summary = match selected_banner {
+                Some(text) => detect_service(&text),
+                None => "No response".to_string(),
             };
 
             serialize_output(&summary)
@@ -108,100 +105,97 @@ pub extern "C" fn analyze(input_ptr: i32, input_len: i32) -> i64 {
     pack_output(output_text)
 }
 
-fn extract_signature(response_bytes: &[u8]) -> String {
-    let response_text = String::from_utf8_lossy(response_bytes);
-    let trimmed = response_text.trim();
+fn send_probe(ip: &str, port: u16, payload: &[u8], use_tls: i32, hostname: &str) -> Option<Vec<u8>> {
+    let packed_response = unsafe {
+        host_send_tcp(
+            ip.as_ptr() as i32,
+            ip.len() as i32,
+            port as i32,
+            payload.as_ptr() as i32,
+            payload.len() as i32,
+            use_tls,
+            hostname.as_ptr() as i32,
+            hostname.len() as i32,
+        )
+    } as u64;
 
-    if trimmed.is_empty() {
+    if packed_response == 0 {
+        return None;
+    }
+
+    let response_ptr = (packed_response >> 32) as u32 as i32;
+    let response_len = (packed_response & 0xFFFF_FFFF) as u32 as i32;
+
+    if response_ptr <= 0 || response_len <= 0 {
+        return None;
+    }
+
+    let response_slice = unsafe { std::slice::from_raw_parts(response_ptr as *const u8, response_len as usize) };
+    let response_bytes = response_slice.to_vec();
+
+    dealloc(response_ptr, response_len);
+
+    Some(response_bytes)
+}
+
+fn detect_service(banner_text: &str) -> String {
+    let normalized = banner_text.trim();
+    if normalized.is_empty() {
         return "No response".to_string();
     }
 
-    let first_line = trimmed
-        .split(['\r', '\n'])
-        .next()
-        .unwrap_or("")
-        .trim();
-
-    let is_http_response = trimmed.contains("HTTP/1.");
-
-    if is_http_response {
-        let server_line = trimmed
-            .split(['\r', '\n'])
-            .map(str::trim)
-            .find(|line| line.to_ascii_lowercase().starts_with("server: "));
-
-        if let Some(line) = server_line {
-            let value = line
-                .split_once(':')
-                .map(|(_, right)| right.trim())
-                .unwrap_or("");
-            if !value.is_empty() {
-                return format!("Service: {}", value);
+    for signature in signatures::SIGNATURES.iter() {
+        if let Some(captures) = signature.regex.captures(normalized) {
+            let details = capture_details(&captures);
+            if details.is_empty() {
+                return format!("Service: {}", signature.service);
             }
+            return format!("Service: {} ({})", signature.service, details);
         }
     }
 
-    if first_line.starts_with("SSH-") {
-        return format!("Service: {}", first_line);
-    }
+    let _fallback_line = first_printable_line(normalized);
+    "Unknown Service".to_string()
+}
 
-    if trimmed.contains("220 ") {
-        return first_line.to_string();
-    }
-
-    let signatures = [
-        (
-            r"(?i)no available server",
-            "Golang net/http server (404/503)",
-        ),
-        (r"(?i)<title>Apache Tomcat.*</title>", "Apache Tomcat"),
-    ];
-
-    for (pattern, service) in signatures {
-        if let Ok(regex) = Regex::new(pattern) {
-            if regex.is_match(trimmed) {
-                return format!("Service: {}", service);
-            }
-        }
-    }
-
-    if is_http_response {
-        if let Ok(title_regex) = Regex::new(r"(?i)<title>(.*?)</title>") {
-            if let Some(captures) = title_regex.captures(trimmed) {
-                if let Some(title_match) = captures.get(1) {
-                    let title = title_match.as_str().trim();
-                    if !title.is_empty() {
-                        return format!("HTTP Service (Title: {})", title);
-                    }
+fn capture_details(captures: &regex::Captures<'_>) -> String {
+    if let Some(version) = captures.name("version") {
+        let cleaned = version.as_str().trim();
+        if !cleaned.is_empty() {
+            if let Some(product) = captures.name("product") {
+                let product_clean = product.as_str().trim();
+                if !product_clean.is_empty() {
+                    return format!("{}; {}", cleaned, product_clean);
                 }
             }
+            return cleaned.to_string();
         }
     }
 
-    let cleaned: String = trimmed
-        .chars()
-        .filter_map(|character| {
-            if character == '\0' {
-                None
-            } else if character.is_control() {
-                Some(' ')
-            } else {
-                Some(character)
+    for index in 1..captures.len() {
+        if let Some(group) = captures.get(index) {
+            let cleaned = group.as_str().trim();
+            if !cleaned.is_empty() {
+                return cleaned.to_string();
             }
-        })
+        }
+    }
+
+    String::new()
+}
+
+fn first_printable_line(text: &str) -> String {
+    let first_line = text.split(['\r', '\n']).next().unwrap_or("").trim();
+    let filtered: String = first_line
+        .chars()
+        .filter(|ch| !ch.is_control() || *ch == ' ' || *ch == '\t')
         .collect();
 
-    let compact = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let snippet: String = compact.chars().take(40).collect();
-
-    if is_http_response {
-        if snippet.is_empty() {
-            return "HTTP Service (Unknown/Hidden)".to_string();
-        }
-        return format!("HTTP Service (Unknown/Hidden): {}", snippet);
+    if filtered.is_empty() {
+        "<empty>".to_string()
+    } else {
+        filtered
     }
-
-    format!("Unknown: {}", snippet)
 }
 
 fn serialize_output(summary: &str) -> String {

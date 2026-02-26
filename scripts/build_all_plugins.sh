@@ -2,14 +2,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET_TRIPLE="wasm32-unknown-unknown"
+TARGET_TRIPLE="${RUSTPROBE_WASM_TARGET:-wasm32-unknown-unknown}"
 RUNTIME_SCRIPTS_DIR="${RUSTPROBE_SCRIPTS_DIR:-}"
 
 if [[ -z "$RUNTIME_SCRIPTS_DIR" ]]; then
   if [[ -n "${APPDATA:-}" ]]; then
-    RUNTIME_SCRIPTS_DIR="$APPDATA/rustprobe/data/scripts"
+    RUNTIME_SCRIPTS_DIR="$APPDATA/rustprobe/scripts"
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    RUNTIME_SCRIPTS_DIR="$HOME/Library/Application Support/rustprobe/scripts"
   else
-    RUNTIME_SCRIPTS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/rustprobe/data/scripts"
+    RUNTIME_SCRIPTS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/rustprobe/scripts"
   fi
 fi
 

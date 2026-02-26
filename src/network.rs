@@ -178,6 +178,7 @@ pub async fn measure_rtt(ip: IpAddr) -> Option<TokioDuration> {
 pub async fn scan_targets(
     targets: &[IpAddr],
     ports: &[u16],
+    hostname: Option<&str>,
     timing: TimingProfile,
     reporter: &LiveReporter,
 ) -> Vec<OpenPort> {
@@ -323,7 +324,11 @@ pub async fn scan_targets(
         if is_open {
             found_count += 1;
             reporter.on_open(found_count, ip, port);
-            open_ports.push(OpenPort { ip, port });
+            open_ports.push(OpenPort {
+                ip,
+                port,
+                hostname: hostname.map(|value| value.to_string()),
+            });
         } else {
             closed_count += 1;
             reporter.on_closed(found_count + closed_count, ip, port);

@@ -128,19 +128,28 @@ pub fn print_report(reports: &[PortReport]) {
 
     println!("\nResultados de scripts:\n");
     let colors_enabled = supports_color();
+    let mut last_ip: Option<IpAddr> = None;
 
     for report in reports {
         if report.scripts.is_empty() {
             continue;
         }
 
+        if last_ip != Some(report.ip) {
+            println!("{}", report.ip);
+            last_ip = Some(report.ip);
+        }
+
         println!(
-            "{} {:>5}/tcp {} {}",
-            report.ip, report.port, report.state, report.service_name
+            "  {:>5}/tcp {} {}",
+            report.port, report.state, report.service_name
         );
 
         for script in &report.scripts {
-            println!("{}", format_script_details_line(&script.script, &script.details, colors_enabled));
+            println!(
+                "  {}",
+                format_script_details_line(&script.script, &script.details, colors_enabled)
+            );
         }
     }
 }
@@ -153,15 +162,33 @@ pub fn write_report_file(path: &Path, reports: &[PortReport]) -> Result<()> {
     writeln!(file, "# Open ports: {}", reports.len())?;
     writeln!(file)?;
 
+    let mut last_ip: Option<IpAddr> = None;
+
     for report in reports {
+        if report.scripts.is_empty() {
+            continue;
+        }
+
+        if last_ip != Some(report.ip) {
+            if last_ip.is_some() {
+                writeln!(file)?;
+            }
+            writeln!(file, "{}", report.ip)?;
+            last_ip = Some(report.ip);
+        }
+
         writeln!(
             file,
-            "{} {:>5}/tcp {} {}",
-            report.ip, report.port, report.state, report.service_name
+            "  {:>5}/tcp {} {}",
+            report.port, report.state, report.service_name
         )?;
 
         for script in &report.scripts {
-            writeln!(file, "{}", format_script_details_line(&script.script, &script.details, false))?;
+            writeln!(
+                file,
+                "  {}",
+                format_script_details_line(&script.script, &script.details, false)
+            )?;
         }
     }
 

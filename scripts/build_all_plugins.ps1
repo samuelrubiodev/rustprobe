@@ -4,12 +4,16 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 }
 
 $scriptDir = $PSScriptRoot
-$targetTriple = 'wasm32-unknown-unknown'
+$targetTriple = if ($env:RUSTPROBE_WASM_TARGET -and $env:RUSTPROBE_WASM_TARGET.Trim().Length -gt 0) {
+    $env:RUSTPROBE_WASM_TARGET.Trim()
+} else {
+    'wasm32-unknown-unknown'
+}
 $maxParallelJobs = 4
 $runtimeScriptsDir = if ($env:RUSTPROBE_SCRIPTS_DIR -and $env:RUSTPROBE_SCRIPTS_DIR.Trim().Length -gt 0) {
     $env:RUSTPROBE_SCRIPTS_DIR
 } elseif ($env:APPDATA -and $env:APPDATA.Trim().Length -gt 0) {
-    Join-Path $env:APPDATA 'rustprobe\data\scripts'
+    Join-Path $env:APPDATA 'rustprobe\scripts'
 } else {
     $null
 }

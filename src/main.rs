@@ -74,6 +74,15 @@ async fn run() -> Result<()> {
         .await
         .with_context(|| format!("No se pudo resolver target '{}'", target))?;
 
+    let scan_hostname = if target.parse::<std::net::IpAddr>().is_ok()
+        || target.contains('/')
+        || target.contains('-')
+    {
+        None
+    } else {
+        Some(target.to_string())
+    };
+
     if targets.is_empty() {
         bail!("No se encontraron IPs válidas para escanear");
     }
@@ -97,7 +106,7 @@ async fn run() -> Result<()> {
     );
 
     let reporter = LiveReporter::new(colors_enabled, show_closed_in_live);
-    let open_ports = scan_targets(&targets, &ports, timing, &reporter).await;
+    let open_ports = scan_targets(&targets, &ports, scan_hostname.as_deref(), timing, &reporter).await;
 
     println!(
         "\n{}: {} puerto(s) abierto(s) detectado(s).",
@@ -112,7 +121,7 @@ async fn run() -> Result<()> {
     let mut reports = Vec::with_capacity(open_ports.len());
     for open in open_ports {
         let scripts = if let Some(engine) = &wasm_engine {
-            engine.run_scripts(open.ip, open.port).with_context(|| {
+            engine.run_scripts(open.ip, open.port, open.hostname.as_deref()).with_context(|| {
                 format!("Falló la ejecución de scripts en {}:{}", open.ip, open.port)
             })?
         } else {
