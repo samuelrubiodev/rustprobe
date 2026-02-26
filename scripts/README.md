@@ -21,6 +21,8 @@ Detecta cualquier subdirectorio dentro de `scripts/` que contenga `Cargo.toml` y
 
 Compila plugins en paralelo automáticamente.
 
+Además del `.wasm` local en `scripts/`, los scripts despliegan automáticamente los plugins al directorio runtime estándar de RustProbe (`data_dir()/scripts`) para que `--script` use la versión recién compilada.
+
 ### Windows (PowerShell)
 
 Desde la raíz del proyecto:
@@ -42,6 +44,7 @@ Notas:
 
 - `--script` recibe nombres separados por coma (ej. `--script smb,http`).
 - Los nombres se buscan en el directorio local estándar (`data_dir()/scripts`).
+- Puedes sobreescribir el destino runtime con la variable `RUSTPROBE_SCRIPTS_DIR`.
 
 ## ABI esperada por el host
 

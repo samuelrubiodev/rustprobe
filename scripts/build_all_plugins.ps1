@@ -6,6 +6,17 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 $scriptDir = $PSScriptRoot
 $targetTriple = 'wasm32-unknown-unknown'
 $maxParallelJobs = 4
+$runtimeScriptsDir = if ($env:RUSTPROBE_SCRIPTS_DIR -and $env:RUSTPROBE_SCRIPTS_DIR.Trim().Length -gt 0) {
+    $env:RUSTPROBE_SCRIPTS_DIR
+} elseif ($env:APPDATA -and $env:APPDATA.Trim().Length -gt 0) {
+    Join-Path $env:APPDATA 'rustprobe\data\scripts'
+} else {
+    $null
+}
+
+if ($runtimeScriptsDir) {
+    New-Item -ItemType Directory -Path $runtimeScriptsDir -Force | Out-Null
+}
 
 $pluginManifests = Get-ChildItem -Path $scriptDir -Directory |
     ForEach-Object { Join-Path $_.FullName 'Cargo.toml' } |
@@ -23,8 +34,8 @@ foreach ($manifest in $pluginManifests) {
         Start-Sleep -Milliseconds 200
     }
 
-    $jobs += Start-Job -ArgumentList $manifest, $scriptDir, $targetTriple -ScriptBlock {
-        param($manifestPath, $scriptsRoot, $target)
+    $jobs += Start-Job -ArgumentList $manifest, $scriptDir, $targetTriple, $runtimeScriptsDir -ScriptBlock {
+        param($manifestPath, $scriptsRoot, $target, $runtimeRoot)
 
         $ErrorActionPreference = 'Continue'
         if ($PSVersionTable.PSVersion.Major -ge 7) {
@@ -55,6 +66,13 @@ foreach ($manifest in $pluginManifests) {
         $outputWasm = Join-Path $scriptsRoot "$pluginName.wasm"
         Copy-Item -Path $builtWasm -Destination $outputWasm -Force
         Write-Host "[+] Plugin ready: $outputWasm"
+
+        if ($runtimeRoot) {
+            New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+            $runtimeWasm = Join-Path $runtimeRoot "$pluginName.wasm"
+            Copy-Item -Path $builtWasm -Destination $runtimeWasm -Force
+            Write-Host "[+] Plugin deployed: $runtimeWasm"
+        }
     }
 }
 

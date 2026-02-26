@@ -3,6 +3,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_TRIPLE="wasm32-unknown-unknown"
+RUNTIME_SCRIPTS_DIR="${RUSTPROBE_SCRIPTS_DIR:-}"
+
+if [[ -z "$RUNTIME_SCRIPTS_DIR" ]]; then
+  if [[ -n "${APPDATA:-}" ]]; then
+    RUNTIME_SCRIPTS_DIR="$APPDATA/rustprobe/data/scripts"
+  else
+    RUNTIME_SCRIPTS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/rustprobe/data/scripts"
+  fi
+fi
+
+mkdir -p "$RUNTIME_SCRIPTS_DIR"
 
 shopt -s nullglob
 manifests=("$SCRIPT_DIR"/*/Cargo.toml)
@@ -42,6 +53,10 @@ build_one() {
   output_wasm="$SCRIPT_DIR/$plugin_name.wasm"
   cp -f "$built_wasm" "$output_wasm"
   echo "[+] Plugin ready: $output_wasm"
+
+  runtime_wasm="$RUNTIME_SCRIPTS_DIR/$plugin_name.wasm"
+  cp -f "$built_wasm" "$runtime_wasm"
+  echo "[+] Plugin deployed: $runtime_wasm"
 }
 
 pids=()
