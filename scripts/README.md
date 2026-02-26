@@ -1,18 +1,6 @@
 # Scripts Wasm para RustProbe
 
-## 1) Compilar plugin de ejemplo
-
-Desde la raíz del proyecto:
-
-```powershell
-./scripts/build_sample_plugin.ps1
-```
-
-Esto genera:
-
-- `./scripts/sample_plugin.wasm`
-
-## 2) Ejecutar RustProbe con plugin
+## 1) Ejecutar RustProbe con plugin
 
 Los scripts Wasm en RustProbe son **opt-in**:
 
@@ -27,14 +15,18 @@ cargo run -- 127.0.0.1 -p 22,80,443 -T T4 --script sample_plugin -oN ./scan.txt
 cargo run -- 127.0.0.1 -p 22,80,443 -T T4 -C -oN ./scan.txt
 ```
 
-## 3) Compilar plugin `http_title`
+## 2) Compilar todos los plugins automáticamente
+
+Detecta cualquier subdirectorio dentro de `scripts/` que contenga `Cargo.toml` y compila todos los plugins Wasm sin listar nombres manualmente.
+
+Compila plugins en paralelo automáticamente.
 
 ### Windows (PowerShell)
 
 Desde la raíz del proyecto:
 
 ```powershell
-./scripts/build_http_title_plugin.ps1
+./scripts/build_all_plugins.ps1
 ```
 
 ### Linux/macOS (Bash)
@@ -42,39 +34,8 @@ Desde la raíz del proyecto:
 Desde la raíz del proyecto:
 
 ```bash
-chmod +x ./scripts/build_http_title_plugin.sh
-./scripts/build_http_title_plugin.sh
-```
-
-Ejecutar el plugin:
-
-```powershell
-cargo run -- 127.0.0.1 -p 80,8080,443 --script http_title -oN ./scan.txt
-```
-
-## 4) Compilar plugin `banner_grabber`
-
-### Windows (PowerShell)
-
-Desde la raíz del proyecto:
-
-```powershell
-./scripts/build_banner_grabber_plugin.ps1
-```
-
-### Linux/macOS (Bash)
-
-Desde la raíz del proyecto:
-
-```bash
-chmod +x ./scripts/build_banner_grabber_plugin.sh
-./scripts/build_banner_grabber_plugin.sh
-```
-
-Ejecutar el plugin:
-
-```powershell
-cargo run -- 127.0.0.1 -p 21,22,25,80,110,143,443 --script banner_grabber -oN ./scan.txt
+chmod +x ./scripts/build_all_plugins.sh
+./scripts/build_all_plugins.sh
 ```
 
 Notas:
