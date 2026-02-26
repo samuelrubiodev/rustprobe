@@ -25,8 +25,13 @@ lazy_static! {
         },
         Signature {
             service: "MySQL",
-            regex: Regex::new(r"(?is)(?:mysql_native_password|mariadb|(?P<version>\d+\.\d+\.\d+)[^\r\n]*mysql)")
+            regex: Regex::new(r"(?is)(?:mysql_native_password|mariadb|(?P<version>\d+\.\d+\.\d+[a-zA-Z0-9.\-]+).*?)")
                 .expect("invalid MySQL signature regex"),
+        },
+        Signature {
+            service: "Samba/SMB",
+            regex: Regex::new(r"(?is)SMB.*?(\x00|%|WORKGROUP|LANMAN)")
+                .expect("invalid Samba/SMB signature regex"),
         },
         Signature {
             service: "VNC",
@@ -35,8 +40,13 @@ lazy_static! {
         },
         Signature {
             service: "IRC",
-            regex: Regex::new(r"(?im)(?:NOTICE\s+AUTH|^:[^\s]+\s+001\s+\S+\s+:)")
+            regex: Regex::new(r"(?im)(?:NOTICE\s+AUTH|^:[^\s]+\s+001\s+\S+\s+:|irc\.Metasploitable\.LAN)")
                 .expect("invalid IRC signature regex"),
+        },
+        Signature {
+            service: "Telnet (Unauthenticated)",
+            regex: Regex::new(r"(?im)(?:^\xff\xfd|Login:|password:|Escape character is)")
+                .expect("invalid Telnet (Unauthenticated) signature regex"),
         },
         Signature {
             service: "Apache",

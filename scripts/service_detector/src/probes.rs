@@ -10,6 +10,12 @@ pub fn build_probe_queue(port: u16, hostname: &str) -> Vec<Probe> {
 
     let mut probes = vec![
         Probe {
+            name: "SMB Negotiate Probe",
+            payload: b"\x00\x00\x00\x2f\xff\x53\x4d\x42\x72\x00\x00\x00\x00\x08\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x4e\x54\x20\x4c\x4d\x20\x30\x2e\x31\x32\x00".to_vec(),
+            use_tls: 0,
+            preferred_ports: &[139, 445],
+        },
+        Probe {
             name: "NULL Probe",
             payload: Vec::new(),
             use_tls: 0,
@@ -35,6 +41,18 @@ pub fn build_probe_queue(port: u16, hostname: &str) -> Vec<Probe> {
         },
     ];
 
-    probes.sort_by_key(|probe| !probe.preferred_ports.contains(&port));
+    probes.sort_by_key(|probe| prioritize_probe(probe, port));
     probes
+}
+
+fn prioritize_probe(probe: &Probe, port: u16) -> u8 {
+    if matches!(port, 139 | 445) && probe.name == "SMB Negotiate Probe" {
+        return 0;
+    }
+
+    if probe.preferred_ports.contains(&port) {
+        1
+    } else {
+        2
+    }
 }
