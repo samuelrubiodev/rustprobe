@@ -1,5 +1,7 @@
-use crate::models::{OpenPort, TimingProfile};
+use crate::models::{PortReport, ScriptResult, TimingProfile};
 use crate::report::LiveReporter;
+use crate::services::get_service_name;
+use crate::wasm::WasmEngine;
 use anyhow::{bail, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use ipnet::IpNet;
@@ -7,6 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::task::JoinSet;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpStream as TokioTcpStream};
 use tokio::sync::mpsc;
@@ -181,7 +184,8 @@ pub async fn scan_targets(
     hostname: Option<&str>,
     timing: TimingProfile,
     reporter: &LiveReporter,
-) -> Vec<OpenPort> {
+    wasm_engine: Option<Arc<WasmEngine>>,
+) -> Vec<PortReport> {
     let worker_count = clamp_concurrency(timing.concurrency);
     let total_checks = targets.len().saturating_mul(ports.len());
 
@@ -202,11 +206,11 @@ pub async fn scan_targets(
                 let adjusted_timeout = dynamic_timeout
                     .max(timing.timeout_ms)
                     .min(timeout_cap);
-                println!(
+                reporter.println(format!(
                     "[i] Latencia a {ip}: {}ms (timeout {}ms)",
                     rtt.as_millis(),
                     adjusted_timeout
-                );
+                ));
                 adjusted_timeout
             }
             None => timing.timeout_ms,
@@ -244,6 +248,7 @@ pub async fn scan_targets(
         let timeout_by_ip = Arc::clone(&timeout_by_ip);
         let ip_states = Arc::clone(&ip_states);
         let retries = timing.retries;
+        let reporter = reporter.clone();
 
         workers.push(tokio::spawn(async move {
             loop {
@@ -302,9 +307,9 @@ pub async fn scan_targets(
 
                 let tarpit_now = ip_state.record_result(is_open);
                 if tarpit_now {
-                    eprintln!(
+                    reporter.warn(format!(
                         "[!] Posible TCP tarpitting detectado en {ip}; abortando puertos restantes para este host."
-                    );
+                    ));
                 }
 
                 if tx.send((ip, port, is_open)).await.is_err() {
@@ -316,19 +321,61 @@ pub async fn scan_targets(
 
     drop(tx);
 
-    let mut open_ports = Vec::new();
+    let mut reports = Vec::new();
     let mut found_count: usize = 0;
     let mut closed_count: usize = 0;
+    let mut script_jobs = JoinSet::new();
+    let scan_hostname = hostname.map(|value| value.to_string());
 
     while let Some((ip, port, is_open)) = rx.recv().await {
         if is_open {
             found_count += 1;
-            reporter.on_open(found_count, ip, port);
-            open_ports.push(OpenPort {
-                ip,
-                port,
-                hostname: hostname.map(|value| value.to_string()),
-            });
+
+            if let Some(engine) = &wasm_engine {
+                let reporter_clone = reporter.clone();
+                let engine = Arc::clone(engine);
+                let pb = reporter.add_scanning_spinner(ip, port);
+                let scan_hostname = scan_hostname.clone();
+
+                script_jobs.spawn(async move {
+                    let script_results = match tokio::task::spawn_blocking(move || {
+                        engine.run_scripts(ip, port, scan_hostname.as_deref())
+                    })
+                    .await
+                    {
+                        Ok(Ok(results)) => results,
+                        Ok(Err(error)) => vec![ScriptResult {
+                            script: "wasm-engine".to_string(),
+                            status: "error".to_string(),
+                            details: format!("{error:#}"),
+                        }],
+                        Err(error) => vec![ScriptResult {
+                            script: "wasm-worker".to_string(),
+                            status: "error".to_string(),
+                            details: format!("{error}"),
+                        }],
+                    };
+
+                    reporter_clone.finish_spinner(pb, ip, port, &script_results);
+
+                    PortReport {
+                        ip,
+                        port,
+                        state: "open",
+                        service_name: get_service_name(port),
+                        scripts: script_results,
+                    }
+                });
+            } else {
+                reporter.on_open(found_count, ip, port);
+                reports.push(PortReport {
+                    ip,
+                    port,
+                    state: "open",
+                    service_name: get_service_name(port),
+                    scripts: Vec::new(),
+                });
+            }
         } else {
             closed_count += 1;
             reporter.on_closed(found_count + closed_count, ip, port);
@@ -337,12 +384,19 @@ pub async fn scan_targets(
 
     while let Some(joined) = workers.next().await {
         if let Err(error) = joined {
-            eprintln!("[!] Worker de escaneo abortado: {error}");
+            reporter.warn(format!("[!] Worker de escaneo abortado: {error}"));
+        }
+    }
+
+    while let Some(job_result) = script_jobs.join_next().await {
+        match job_result {
+            Ok(report) => reports.push(report),
+            Err(error) => reporter.warn(format!("[!] Worker de scripts abortado: {error}")),
         }
     }
 
     reporter.summary(found_count, closed_count, total_checks);
 
-    open_ports.sort_by_key(|item| (item.ip, item.port));
-    open_ports
+    reports.sort_by_key(|item| (item.ip, item.port));
+    reports
 }
