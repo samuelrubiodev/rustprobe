@@ -25,8 +25,13 @@ const BURST_SIZE: usize = 64;
 /// an 8 000-port scan noticeably slower (~250 ms overhead total).
 const BURST_PAUSE_MS: u64 = 2;
 
-/// Fixed post-send drain window: how long we wait for late SYN-ACKs.
-const DRAIN_WINDOW_MS: u64 = 1_500;
+/// Adaptive drain – stop early if no new hit arrives within this window.
+/// 200 ms is generous for LAN; remote SYN-ACKs also arrive well within this.
+const DRAIN_QUIET_MS: u64 = 200;
+
+/// Hard cap for the drain phase regardless of how frequent the hits are.
+/// Keeps the total scan time bounded even on very noisy networks.
+const DRAIN_MAX_MS: u64 = 2_000;
 
 /// Max back-off retries when the kernel returns ENOBUFS.
 const ENOBUFS_RETRIES: u8 = 5;
@@ -129,6 +134,9 @@ pub async fn run_syn_scan(
     let mut sent_count: usize = 0;
     let mut buf = [0u8; 20]; // reusable 20-byte packet buffer
 
+    // open_set is shared across passes and the inter-pass mini-drain.
+    let mut open_set: HashSet<(Ipv4Addr, u16)> = HashSet::new();
+
     for attempt in 0..=max_retries {
         for (idx, &dst_ip) in ipv4_targets.iter().enumerate() {
             let Some(src_ip) = src_ips[idx] else {
@@ -167,34 +175,21 @@ pub async fn run_syn_scan(
             }
         }
 
-        // Between retry passes give in-flight SYN-ACKs time to arrive.
+        // Between retry passes: run a mini adaptive drain so SYN-ACKs from
+        // the current pass are collected before we flood the wire again.
+        // Uses the same quiet-window logic as the final drain (200 ms quiet
+        // or 500 ms hard cap), but does NOT drop hit_rx – scanning continues.
         if attempt < max_retries {
-            sleep(Duration::from_millis(300)).await;
+            drain_adaptive(&hit_rx, &mut open_set, DRAIN_QUIET_MS, 500);
         }
     }
 
-    // ── 6. Drain window ─────────────────────────────────────────────────────
+    // ── 6. Adaptive drain window ────────────────────────────────────────────
     //
-    // Collect SYN-ACK hits for a fixed 1.5 s using recv_timeout.
-    // Dropping hit_rx closes the channel so the radar thread exits.
-    let drain_deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(DRAIN_WINDOW_MS);
-
-    let mut open_set: HashSet<(Ipv4Addr, u16)> = HashSet::new();
-    loop {
-        let now = std::time::Instant::now();
-        if now >= drain_deadline {
-            break;
-        }
-        match hit_rx.recv_timeout(drain_deadline - now) {
-            Ok(hit) => {
-                open_set.insert(hit);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    // hit_rx dropped here → channel closed → radar thread's next send() fails → exits.
+    // Collect hits until the flow goes quiet for DRAIN_QUIET_MS or the hard
+    // cap DRAIN_MAX_MS is reached.  Dropping hit_rx signals the radar thread.
+    drain_adaptive(&hit_rx, &mut open_set, DRAIN_QUIET_MS, DRAIN_MAX_MS);
+    // hit_rx dropped at end of scope → channel closed → radar thread exits.
 
     // ── 7. Build report ─────────────────────────────────────────────────────
     let mut reports: Vec<PortReport> = Vec::new();
@@ -222,7 +217,45 @@ pub async fn run_syn_scan(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Returns the OS-specific errno/WSA code for "no buffer space available".
+/// Adaptive drain: collect hits from `rx` until no new hit arrives within
+/// `quiet_ms` milliseconds, or `max_ms` milliseconds have elapsed in total.
+///
+/// Can be called multiple times (e.g., between scan passes) sharing the same
+/// `rx` and `set`; it never closes the channel.
+fn drain_adaptive(
+    rx: &std::sync::mpsc::Receiver<(Ipv4Addr, u16)>,
+    set: &mut HashSet<(Ipv4Addr, u16)>,
+    quiet_ms: u64,
+    max_ms: u64,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let hard_deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
+    let mut quiet_deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(quiet_ms);
+
+    loop {
+        let now = std::time::Instant::now();
+        if now >= hard_deadline {
+            break;
+        }
+        // Use the sooner of the two deadlines as the recv timeout.
+        let timeout = quiet_deadline.min(hard_deadline).saturating_duration_since(now);
+        match rx.recv_timeout(timeout) {
+            Ok(hit) => {
+                set.insert(hit);
+                // Reset the quiet window – traffic is still flowing.
+                quiet_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(quiet_ms);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Quiet window expired first: no traffic for quiet_ms.
+                break;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
 #[inline]
 fn enobufs_code() -> i32 {
     if cfg!(unix) {
