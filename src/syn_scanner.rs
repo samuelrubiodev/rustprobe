@@ -88,7 +88,10 @@ pub async fn run_syn_scan(
                 // Verificar si el paquete TCP tiene las flags SYN | ACK (0x012)
                 if packet.get_flags() == (TcpFlags::SYN | TcpFlags::ACK) {
                     let source_port = packet.get_source();
-                    open_ports_clone.lock().unwrap().push((addr, source_port));
+                    // Solo registrar si el puerto de destino coincide con nuestro puerto de origen (54321)
+                    if packet.get_destination() == 54321 {
+                        open_ports_clone.lock().unwrap().push((addr, source_port));
+                    }
                 }
             }
         }
@@ -151,8 +154,10 @@ pub async fn run_syn_scan(
     let dummy_ip = Ipv4Addr::new(127, 0, 0, 1);
     let mut dummy_buf = [0u8; 20];
     if let Some(mut dummy_pkt) = MutableTcpPacket::new(&mut dummy_buf) {
+        dummy_pkt.set_source(80);
+        dummy_pkt.set_destination(54321);
         dummy_pkt.set_data_offset(5);
-        dummy_pkt.set_flags(TcpFlags::SYN);
+        dummy_pkt.set_flags(TcpFlags::SYN | TcpFlags::ACK);
         let _ = tx.send_to(dummy_pkt, IpAddr::V4(dummy_ip));
     }
 
