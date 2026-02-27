@@ -15,3 +15,4 @@ tokio = { version = "1.44.1", features = ["full"] }
 tokio-native-tls = "0.3.1"
 wasmtime = "30.0.2"
 directories = "5.0"
+indicatif = "0.17"

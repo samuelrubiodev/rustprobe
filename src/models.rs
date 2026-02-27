@@ -8,13 +8,6 @@ pub struct TimingProfile {
     pub retries: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct OpenPort {
-    pub ip: IpAddr,
-    pub port: u16,
-    pub hostname: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ScriptResult {
     pub script: String,

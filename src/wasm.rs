@@ -31,17 +31,36 @@ impl WasmEngine {
         let mut results = Vec::with_capacity(self.modules.len());
 
         for (script_name, module) in &self.modules {
-            match self.run_single(module, ip, port, hostname) {
-                Ok(output) => results.push(ScriptResult {
-                    script: script_name.clone(),
-                    status: "ok".to_string(),
-                    details: output,
-                }),
-                Err(err) => results.push(ScriptResult {
-                    script: script_name.clone(),
-                    status: "error".to_string(),
-                    details: format!("{err:#}"),
-                }),
+            let mut attempts = 0u8;
+            let max_attempts = 4u8;
+
+            loop {
+                match self.run_single(module, ip, port, hostname) {
+                    Ok(output) => {
+                        results.push(ScriptResult {
+                            script: script_name.clone(),
+                            status: "ok".to_string(),
+                            details: output,
+                        });
+                        break;
+                    }
+                    Err(err) => {
+                        attempts = attempts.saturating_add(1);
+
+                        if attempts < max_attempts && is_too_many_open_files(&err) {
+                            let backoff_ms = 30u64.saturating_mul(1u64 << attempts.min(5));
+                            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                            continue;
+                        }
+
+                        results.push(ScriptResult {
+                            script: script_name.clone(),
+                            status: "error".to_string(),
+                            details: format!("{err:#}"),
+                        });
+                        break;
+                    }
+                }
             }
         }
 
@@ -412,7 +431,7 @@ async fn tcp_exchange_async(
     tls_hostname: String,
 ) -> Result<Vec<u8>> {
     let socket = SocketAddr::new(ip_addr, port);
-    let stream = timeout(Duration::from_secs(2), TokioTcpStream::connect(socket))
+    let stream = timeout(Duration::from_secs(4), TokioTcpStream::connect(socket))
         .await
         .context("Timeout al conectar por TCP")?
         .context("No se pudo conectar por TCP")?;
@@ -474,9 +493,15 @@ where
 {
     let mut response = Vec::new();
     let mut temp = [0u8; 4096];
+    let first_chunk_timeout = if wait_first_chunk {
+        Duration::from_secs(4)
+    } else {
+        Duration::from_millis(3_000)
+    };
+    let chunk_timeout = Duration::from_millis(3_000);
 
     if wait_first_chunk {
-        match timeout(Duration::from_secs(2), stream.read(&mut temp)).await {
+        match timeout(first_chunk_timeout, stream.read(&mut temp)).await {
             Ok(Ok(0)) => return Ok(response),
             Ok(Ok(n)) => response.extend_from_slice(&temp[..n]),
             Ok(Err(err))
@@ -491,7 +516,7 @@ where
     }
 
     loop {
-        match timeout(Duration::from_secs(2), stream.read(&mut temp)).await {
+        match timeout(chunk_timeout, stream.read(&mut temp)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => response.extend_from_slice(&temp[..n]),
             Ok(Err(err))
@@ -510,6 +535,13 @@ where
 
 fn pack_ptr_len(ptr: i32, len: i32) -> i64 {
     (((ptr as u32 as u64) << 32) | (len as u32 as u64)) as i64
+}
+
+fn is_too_many_open_files(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("too many open files") || message.contains("os error 24")
+    })
 }
 
 fn load_wasm_modules(engine: &Engine, path: &Path) -> Result<Vec<(String, Module)>> {

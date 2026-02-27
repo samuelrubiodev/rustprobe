@@ -9,13 +9,13 @@ mod wasm;
 
 use crate::cli::{parse_cli, parse_ports, parse_timing, should_show_closed_in_live};
 use crate::config::{ensure_default_scripts_dir, has_wasm_files};
-use crate::models::{PortReport, TimingProfile};
+use crate::models::TimingProfile;
 use crate::network::{clamp_concurrency, resolve_targets, scan_targets};
 use crate::report::{paint, print_report, supports_color, write_report_file, LiveReporter};
-use crate::services::get_service_name;
 use crate::update::update_scripts;
 use crate::wasm::WasmEngine;
 use anyhow::{bail, Context, Result};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -44,13 +44,13 @@ async fn run() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Debes especificar un objetivo o usar --update"))?;
 
     let wasm_engine = if !cli.script.is_empty() {
-        Some(WasmEngine::load_named_from_dir(
+        Some(Arc::new(WasmEngine::load_named_from_dir(
             &default_scripts_dir,
             &cli.script,
-        )?)
+        )?))
     } else if cli.default_scripts {
         if has_wasm_files(&default_scripts_dir)? {
-            Some(WasmEngine::load(&default_scripts_dir)?)
+            Some(Arc::new(WasmEngine::load(&default_scripts_dir)?))
         } else {
             println!(
                 "[i] Directorio de scripts local vacío. Añade archivos .wasm en {} para usar --default-scripts.",
@@ -106,35 +106,24 @@ async fn run() -> Result<()> {
     );
 
     let reporter = LiveReporter::new(colors_enabled, show_closed_in_live);
-    let open_ports = scan_targets(&targets, &ports, scan_hostname.as_deref(), timing, &reporter).await;
+    let reports = scan_targets(
+        &targets,
+        &ports,
+        scan_hostname.as_deref(),
+        timing,
+        &reporter,
+        wasm_engine.clone(),
+    )
+    .await;
 
     println!(
         "\n{}: {} puerto(s) abierto(s) detectado(s).",
         paint("Escaneo finalizado", "1;36", colors_enabled),
-        open_ports.len()
+        reports.len()
     );
 
     if cli.default_scripts && wasm_engine.is_some() && cli.script.is_empty() {
         println!("[+] Plugins Wasm locales detectados. Análisis adicional activado por --default-scripts.");
-    }
-
-    let mut reports = Vec::with_capacity(open_ports.len());
-    for open in open_ports {
-        let scripts = if let Some(engine) = &wasm_engine {
-            engine.run_scripts(open.ip, open.port, open.hostname.as_deref()).with_context(|| {
-                format!("Falló la ejecución de scripts en {}:{}", open.ip, open.port)
-            })?
-        } else {
-            Vec::new()
-        };
-
-        reports.push(PortReport {
-            ip: open.ip,
-            port: open.port,
-            state: "open",
-            service_name: get_service_name(open.port),
-            scripts,
-        });
     }
 
     print_report(&reports);
