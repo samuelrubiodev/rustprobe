@@ -91,6 +91,10 @@ impl LiveReporter {
         );
     }
 
+    pub fn println(&self, msg: String) {
+        println!("{}", msg);
+    }
+
     fn elapsed(&self) -> Duration {
         self.started_at.elapsed()
     }

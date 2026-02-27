@@ -107,10 +107,11 @@ async fn run() -> Result<()> {
         timing.concurrency
     );
 
+    let reporter = LiveReporter::new(colors_enabled, show_closed_in_live);
+
     let reports = if cli.syn {
-        run_syn_scan(&targets, &ports, timing).await?
+        run_syn_scan(&targets, &ports, timing, &reporter).await?
     } else {
-        let reporter = LiveReporter::new(colors_enabled, show_closed_in_live);
         let open_ports =
             scan_targets(&targets, &ports, scan_hostname.as_deref(), timing, &reporter).await;
 

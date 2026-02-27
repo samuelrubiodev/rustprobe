@@ -32,8 +32,7 @@ pub struct Cli {
     #[arg(short = 'T', long = "timing", default_value = "T3")]
     pub timing: String,
 
-    /// Realiza un escaneo Stealth SYN (Requiere privilegios de Root/Administrador)
-    #[arg(short = 'S', long = "syn")]
+    #[arg(short = 's', long = "syn", help = "Realiza un escaneo Stealth SYN (Requiere privilegios de Root/Administrador)")]
     pub syn: bool,
 
     /// Script(s) Wasm por nombre (ej: --script smb,http), buscados en el directorio local estándar
