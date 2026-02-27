@@ -5,17 +5,60 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_TRIPLE="${RUSTPROBE_WASM_TARGET:-wasm32-unknown-unknown}"
 RUNTIME_SCRIPTS_DIR="${RUSTPROBE_SCRIPTS_DIR:-}"
 
-if [[ -z "$RUNTIME_SCRIPTS_DIR" ]]; then
+# ── Resolve deploy targets ───────────────────────────────────────────────────
+#
+# rustprobe uses the `directories` crate (XDG data dir) to locate scripts.
+# When invoked with `sudo`, that resolves to /root/.local/share/rustprobe/scripts.
+# When invoked without `sudo`, it resolves to $HOME/.local/share/rustprobe/scripts.
+# We need to deploy to BOTH so that scripts work regardless of how the binary
+# is launched (SYN mode always requires sudo; other modes usually don't).
+
+_xdg_data() {
+  local home_dir="$1"
+  echo "${XDG_DATA_HOME:-$home_dir/.local/share}/rustprobe/scripts"
+}
+
+_data_dir_for_home() {
+  local home_dir="$1"
   if [[ -n "${APPDATA:-}" ]]; then
-    RUNTIME_SCRIPTS_DIR="$APPDATA/rustprobe/scripts"
+    echo "$APPDATA/rustprobe/scripts"
   elif [[ "$(uname -s)" == "Darwin" ]]; then
-    RUNTIME_SCRIPTS_DIR="$HOME/Library/Application Support/rustprobe/scripts"
+    echo "$home_dir/Library/Application Support/rustprobe/scripts"
   else
-    RUNTIME_SCRIPTS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/rustprobe/scripts"
+    echo "$(_xdg_data "$home_dir")"
   fi
+}
+
+declare -a DEPLOY_DIRS=()
+
+if [[ -z "$RUNTIME_SCRIPTS_DIR" ]]; then
+  # Primary: current effective user
+  DEPLOY_DIRS+=("$(_data_dir_for_home "$HOME")")
+
+  # Secondary: if running as non-root, also deploy to root (for sudo usage)
+  if [[ $EUID -ne 0 ]]; then
+    ROOT_HOME="$(getent passwd root | cut -d: -f6 2>/dev/null || echo /root)"
+    DEPLOY_DIRS+=("$(_data_dir_for_home "$ROOT_HOME")")
+  fi
+
+  # Secondary: if running as root via sudo, also deploy to the invoking user
+  if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6 2>/dev/null || echo /home/"$SUDO_USER")"
+    USER_DIR="$(_data_dir_for_home "$USER_HOME")"
+    # avoid duplicating the primary dir
+    if [[ "$USER_DIR" != "${DEPLOY_DIRS[0]}" ]]; then
+      DEPLOY_DIRS+=("$USER_DIR")
+    fi
+  fi
+else
+  DEPLOY_DIRS+=("$RUNTIME_SCRIPTS_DIR")
 fi
 
-mkdir -p "$RUNTIME_SCRIPTS_DIR"
+for dir in "${DEPLOY_DIRS[@]}"; do
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    sudo mkdir -p "$dir" 2>/dev/null || true
+  fi
+done
 
 shopt -s nullglob
 manifests=("$SCRIPT_DIR"/*/Cargo.toml)
@@ -56,9 +99,16 @@ build_one() {
   cp -f "$built_wasm" "$output_wasm"
   echo "[+] Plugin ready: $output_wasm"
 
-  runtime_wasm="$RUNTIME_SCRIPTS_DIR/$plugin_name.wasm"
-  cp -f "$built_wasm" "$runtime_wasm"
-  echo "[+] Plugin deployed: $runtime_wasm"
+  for deploy_dir in "${DEPLOY_DIRS[@]}"; do
+    runtime_wasm="$deploy_dir/$plugin_name.wasm"
+    if cp -f "$built_wasm" "$runtime_wasm" 2>/dev/null; then
+      echo "[+] Plugin deployed: $runtime_wasm"
+    elif sudo cp -f "$built_wasm" "$runtime_wasm" 2>/dev/null; then
+      echo "[+] Plugin deployed (sudo): $runtime_wasm"
+    else
+      echo "[!] Could not deploy to $runtime_wasm (skipping)" >&2
+    fi
+  done
 }
 
 pids=()
@@ -81,3 +131,7 @@ if (( failed != 0 )); then
 fi
 
 echo "[+] Completed. Built ${#manifests[@]} plugin(s)."
+echo "[i] Plugins deployed to:"
+for dir in "${DEPLOY_DIRS[@]}"; do
+  echo "      $dir"
+done
