@@ -136,6 +136,9 @@ pub async fn run_syn_scan(
 
     // open_set is shared across passes and the inter-pass mini-drain.
     let mut open_set: HashSet<(Ipv4Addr, u16)> = HashSet::new();
+    // Counter tracks how many hits have been printed so far (shared across
+    // all drain calls so on_open indices are globally sequential).
+    let mut hits_reported: usize = 0;
 
     for attempt in 0..=max_retries {
         for (idx, &dst_ip) in ipv4_targets.iter().enumerate() {
@@ -180,7 +183,7 @@ pub async fn run_syn_scan(
         // Uses the same quiet-window logic as the final drain (200 ms quiet
         // or 500 ms hard cap), but does NOT drop hit_rx – scanning continues.
         if attempt < max_retries {
-            drain_adaptive(&hit_rx, &mut open_set, DRAIN_QUIET_MS, 500);
+            drain_adaptive(&hit_rx, &mut open_set, DRAIN_QUIET_MS, 500, reporter, &mut hits_reported);
         }
     }
 
@@ -188,10 +191,11 @@ pub async fn run_syn_scan(
     //
     // Collect hits until the flow goes quiet for DRAIN_QUIET_MS or the hard
     // cap DRAIN_MAX_MS is reached.  Dropping hit_rx signals the radar thread.
-    drain_adaptive(&hit_rx, &mut open_set, DRAIN_QUIET_MS, DRAIN_MAX_MS);
+    drain_adaptive(&hit_rx, &mut open_set, DRAIN_QUIET_MS, DRAIN_MAX_MS, reporter, &mut hits_reported);
     // hit_rx dropped at end of scope → channel closed → radar thread exits.
 
     // ── 7. Build report ─────────────────────────────────────────────────────
+    // Ports were already printed in real-time; just build the return value.
     let mut reports: Vec<PortReport> = Vec::new();
     for &ip in &ipv4_targets {
         for &port in ports {
@@ -208,9 +212,6 @@ pub async fn run_syn_scan(
     }
 
     reports.sort_by_key(|r| (r.ip, r.port));
-    for (idx, report) in reports.iter().enumerate() {
-        reporter.on_open(idx + 1, report.ip, report.port);
-    }
 
     Ok(reports)
 }
@@ -220,13 +221,15 @@ pub async fn run_syn_scan(
 /// Adaptive drain: collect hits from `rx` until no new hit arrives within
 /// `quiet_ms` milliseconds, or `max_ms` milliseconds have elapsed in total.
 ///
-/// Can be called multiple times (e.g., between scan passes) sharing the same
-/// `rx` and `set`; it never closes the channel.
+/// Each **new** hit (not a duplicate) is printed immediately via `reporter`.
+/// Can be called multiple times sharing the same `rx`, `set`, and `counter`.
 fn drain_adaptive(
     rx: &std::sync::mpsc::Receiver<(Ipv4Addr, u16)>,
     set: &mut HashSet<(Ipv4Addr, u16)>,
     quiet_ms: u64,
     max_ms: u64,
+    reporter: &LiveReporter,
+    counter: &mut usize,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
     let hard_deadline =
@@ -243,7 +246,11 @@ fn drain_adaptive(
         let timeout = quiet_deadline.min(hard_deadline).saturating_duration_since(now);
         match rx.recv_timeout(timeout) {
             Ok(hit) => {
-                set.insert(hit);
+                // Only report and count genuinely new ports.
+                if set.insert(hit) {
+                    *counter += 1;
+                    reporter.on_open(*counter, IpAddr::V4(hit.0), hit.1);
+                }
                 // Reset the quiet window – traffic is still flowing.
                 quiet_deadline =
                     std::time::Instant::now() + std::time::Duration::from_millis(quiet_ms);
