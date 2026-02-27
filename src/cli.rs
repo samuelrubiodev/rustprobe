@@ -13,7 +13,7 @@ use crate::models::TimingProfile;
     version,
     about = "Escáner de red de alto rendimiento con motor de plugins Wasm",
     next_line_help = true,
-    after_help = "Notas:\n  - El análisis Wasm es opt-in: solo se activa con --script o -C/--default-scripts.\n  - -oN (nmap) es compatible y se normaliza a --output.\n\nEjemplos:\n  rustprobe 10.0.2.16 -p 80\n  rustprobe 10.0.2.16 -p 80,443 --script http\n  rustprobe 10.0.2.16 -p 1-1024 -C\n  rustprobe --update"
+    after_help = "Notas:\n  - El análisis Wasm es opt-in: solo se activa con --script o -C/--default-scripts.\n  - -oN (nmap) es compatible y se normaliza a --output.\n  - El modo SYN (-s / --syn / -sS) es ~15x más rápido que el modo por defecto\n    y no completa el handshake TCP, por lo que no deja rastro en los logs de\n    aplicación. Requiere privilegios de root/administrador.\n\nEjemplos:\n  rustprobe 10.0.2.16 -p 80\n  rustprobe 10.0.2.16 -p 1-8000 -s\n  rustprobe 10.0.2.16 -p 1-8000 --syn\n  rustprobe 10.0.2.16 -p 1-8000 -sS\n  rustprobe 10.0.2.16 -p 80,443 --script http\n  rustprobe 10.0.2.16 -p 1-1024 -C\n  rustprobe --update"
 )]
 pub struct Cli {
     /// Objetivo a escanear: IP, rango (A.B.C.D-E.F.G.H), CIDR o dominio
@@ -45,7 +45,7 @@ pub struct Cli {
     pub output: Option<PathBuf>,
 
     /// Realiza un escaneo Stealth SYN (Requiere privilegios de Root/Administrador)
-    #[arg(long = "syn")]
+    #[arg(short = 's', long = "syn")]
     pub syn: bool,
 }
 
