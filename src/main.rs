@@ -4,6 +4,7 @@ mod models;
 mod network;
 mod report;
 mod services;
+mod syn_scanner;
 mod update;
 mod wasm;
 
@@ -13,6 +14,7 @@ use crate::models::{PortReport, TimingProfile};
 use crate::network::{clamp_concurrency, resolve_targets, scan_targets};
 use crate::report::{paint, print_report, supports_color, write_report_file, LiveReporter};
 use crate::services::get_service_name;
+use crate::syn_scanner::run_syn_scan;
 use crate::update::update_scripts;
 use crate::wasm::WasmEngine;
 use anyhow::{bail, Context, Result};
@@ -105,36 +107,52 @@ async fn run() -> Result<()> {
         timing.concurrency
     );
 
-    let reporter = LiveReporter::new(colors_enabled, show_closed_in_live);
-    let open_ports = scan_targets(&targets, &ports, scan_hostname.as_deref(), timing, &reporter).await;
+    let reports = if cli.syn {
+        run_syn_scan(&targets, &ports, timing).await?
+    } else {
+        let reporter = LiveReporter::new(colors_enabled, show_closed_in_live);
+        let open_ports =
+            scan_targets(&targets, &ports, scan_hostname.as_deref(), timing, &reporter).await;
 
-    println!(
-        "\n{}: {} puerto(s) abierto(s) detectado(s).",
-        paint("Escaneo finalizado", "1;36", colors_enabled),
-        open_ports.len()
-    );
+        println!(
+            "\n{}: {} puerto(s) abierto(s) detectado(s).",
+            paint("Escaneo finalizado", "1;36", colors_enabled),
+            open_ports.len()
+        );
 
-    if cli.default_scripts && wasm_engine.is_some() && cli.script.is_empty() {
-        println!("[+] Plugins Wasm locales detectados. Análisis adicional activado por --default-scripts.");
-    }
+        if cli.default_scripts && wasm_engine.is_some() && cli.script.is_empty() {
+            println!("[+] Plugins Wasm locales detectados. Análisis adicional activado por --default-scripts.");
+        }
 
-    let mut reports = Vec::with_capacity(open_ports.len());
-    for open in open_ports {
-        let scripts = if let Some(engine) = &wasm_engine {
-            engine.run_scripts(open.ip, open.port, open.hostname.as_deref()).with_context(|| {
-                format!("Falló la ejecución de scripts en {}:{}", open.ip, open.port)
-            })?
-        } else {
-            Vec::new()
-        };
+        let mut reports = Vec::with_capacity(open_ports.len());
+        for open in open_ports {
+            let scripts = if let Some(engine) = &wasm_engine {
+                engine
+                    .run_scripts(open.ip, open.port, open.hostname.as_deref())
+                    .with_context(|| {
+                        format!("Falló la ejecución de scripts en {}:{}", open.ip, open.port)
+                    })?
+            } else {
+                Vec::new()
+            };
 
-        reports.push(PortReport {
-            ip: open.ip,
-            port: open.port,
-            state: "open",
-            service_name: get_service_name(open.port),
-            scripts,
-        });
+            reports.push(PortReport {
+                ip: open.ip,
+                port: open.port,
+                state: "open",
+                service_name: get_service_name(open.port),
+                scripts,
+            });
+        }
+
+        reports
+    };
+
+    if cli.syn {
+        println!(
+            "\n{}: Motor SYN inicializado (implementación en progreso).",
+            paint("Escaneo finalizado", "1;36", colors_enabled)
+        );
     }
 
     print_report(&reports);

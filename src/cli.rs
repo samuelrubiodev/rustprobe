@@ -32,6 +32,10 @@ pub struct Cli {
     #[arg(short = 'T', long = "timing", default_value = "T3")]
     pub timing: String,
 
+    /// Realiza un escaneo Stealth SYN (Requiere privilegios de Root/Administrador)
+    #[arg(short = 'S', long = "syn")]
+    pub syn: bool,
+
     /// Script(s) Wasm por nombre (ej: --script smb,http), buscados en el directorio local estándar
     #[arg(long = "script", value_delimiter = ',')]
     pub script: Vec<String>,
@@ -145,6 +149,11 @@ fn normalize_nmap_shortcuts(args: impl IntoIterator<Item = OsString>) -> Vec<OsS
 
     for arg in args {
         if let Some(text) = arg.to_str() {
+            if text == "-sS" {
+                normalized.push(OsString::from("--syn"));
+                continue;
+            }
+
             if text == "-oN" {
                 normalized.push(OsString::from("--output"));
                 continue;
