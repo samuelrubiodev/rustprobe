@@ -13,7 +13,7 @@ use crate::models::TimingProfile;
     version,
     about = "Escáner de red de alto rendimiento con motor de plugins Wasm",
     next_line_help = true,
-    after_help = "Notas:\n  - El análisis Wasm es opt-in: solo se activa con --script o -C/--default-scripts.\n  - -oN (nmap) es compatible y se normaliza a --output.\n\nEjemplos:\n  rustprobe 10.0.2.16 -p 80\n  rustprobe 10.0.2.16 -p 80,443 --script http\n  rustprobe 10.0.2.16 -p 1-1024 -C\n  rustprobe --update"
+    after_help = "Notas:\n  - El análisis Wasm es opt-in: solo se activa con --script o -C/--default-scripts.\n  - -oN (nmap) es compatible y se normaliza a --output.\n  - El modo SYN (-s / --syn / -sS) es ~15x más rápido que el modo por defecto\n    y no completa el handshake TCP, por lo que no deja rastro en los logs de\n    aplicación. Requiere privilegios de root/administrador.\n\nEjemplos:\n  rustprobe 10.0.2.16 -p 80\n  rustprobe 10.0.2.16 -p 1-8000 -s\n  rustprobe 10.0.2.16 -p 1-8000 --syn\n  rustprobe 10.0.2.16 -p 1-8000 -sS\n  rustprobe 10.0.2.16 -p 80,443 --script http\n  rustprobe 10.0.2.16 -p 1-1024 -C\n  rustprobe --update"
 )]
 pub struct Cli {
     /// Objetivo a escanear: IP, rango (A.B.C.D-E.F.G.H), CIDR o dominio
@@ -43,6 +43,10 @@ pub struct Cli {
     /// Archivo de salida (compatibilidad nmap: -oN)
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
+
+    /// Realiza un escaneo Stealth SYN (Requiere privilegios de Root/Administrador)
+    #[arg(short = 's', long = "syn")]
+    pub syn: bool,
 }
 
 pub fn parse_cli() -> Cli {
@@ -140,13 +144,18 @@ pub fn should_show_closed_in_live(raw_ports: &str) -> bool {
 }
 
 fn normalize_nmap_shortcuts(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    // Compatibilidad con sintaxis de nmap: "-oN archivo.txt" o "-oNarchivo.txt".
+    // Compatibilidad con sintaxis de nmap: "-oN archivo.txt", "-oNarchivo.txt" y "-sS".
     let mut normalized = Vec::new();
 
     for arg in args {
         if let Some(text) = arg.to_str() {
             if text == "-oN" {
                 normalized.push(OsString::from("--output"));
+                continue;
+            }
+
+            if text == "-sS" {
+                normalized.push(OsString::from("--syn"));
                 continue;
             }
 
