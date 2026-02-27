@@ -96,7 +96,12 @@ pub async fn run_syn_scan(
 
     // 5. El Hilo del FRANCOTIRADOR (Emisor)
     // Usamos un delay basado en el timeout del TimingProfile para no saturar la red
-    let delay = Duration::from_millis(timing.timeout_ms.max(10) / 10);
+    // Para T5 (Insane), el delay debería ser 0 o muy cercano a 0.
+    let delay = if timing.timeout_ms <= 100 {
+        Duration::from_micros(0) // Sin delay para perfiles agresivos
+    } else {
+        Duration::from_millis(timing.timeout_ms.max(10) / 10)
+    };
 
     for &target_ipv4 in &ipv4_targets {
         let local_ipv4 = match get_local_ip(target_ipv4) {
