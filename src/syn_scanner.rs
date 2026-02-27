@@ -1,8 +1,8 @@
 use crate::services::get_service_name;
+use crate::report::LiveReporter;
 use anyhow::{bail, Context, Result};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::tcp::{ipv4_checksum, MutableTcpPacket, TcpFlags, TcpOption, TcpPacket};
-use pnet::packet::Packet;
 use pnet::transport::{
     tcp_packet_iter, transport_channel, TransportChannelType::Layer4, TransportProtocol::Ipv4,
 };
@@ -18,6 +18,7 @@ pub async fn run_syn_scan(
     targets: &[IpAddr],
     ports: &[u16],
     timing: TimingProfile,
+    reporter: &LiveReporter,
 ) -> Result<Vec<PortReport>> {
     if !has_raw_socket_privileges() {
         bail!(
@@ -81,7 +82,8 @@ pub async fn run_syn_scan(
         }
     });
 
-    let burst_size = timing.concurrency.clamp(1, 512);
+    let burst_size = timing.concurrency.clamp(32, 256);
+    let max_retries = timing.retries.max(1);
     let mut sent_count: usize = 0;
 
     for &dst_ip in &ipv4_targets {
@@ -90,24 +92,33 @@ pub async fn run_syn_scan(
         };
 
         for &dst_port in ports {
-            let mut packet_buf = [0u8; 40];
-            let packet_len = build_syn_packet(src_ip, dst_ip, src_port, dst_port, &mut packet_buf);
-            if let Some(packet) = TcpPacket::new(&packet_buf[..packet_len]) {
-                let _ = tx.send_to(packet, IpAddr::V4(dst_ip));
-            }
+            for _attempt in 0..=max_retries {
+                let mut packet_buf = [0u8; 20];
+                let packet_len =
+                    build_syn_packet(src_ip, dst_ip, src_port, dst_port, &mut packet_buf);
 
-            sent_count += 1;
-            if sent_count % burst_size == 0 {
-                tokio::task::yield_now().await;
-            }
+                if let Some(packet) = TcpPacket::new(&packet_buf[..packet_len]) {
+                    let _ = tx.send_to(packet, IpAddr::V4(dst_ip));
+                }
 
-            if timing.concurrency <= 32 {
-                sleep(Duration::from_millis(1)).await;
+                sent_count += 1;
+                if sent_count % burst_size == 0 {
+                    sleep(Duration::from_millis(1)).await;
+                }
+
+                if timing.concurrency <= 64 {
+                    sleep(Duration::from_micros(500)).await;
+                }
             }
         }
     }
 
-    sleep(Duration::from_secs(3)).await;
+    let drain_ms = timing
+        .timeout_ms
+        .saturating_mul(max_retries as u64 + 1)
+        .max(2_000)
+        .min(8_000);
+    sleep(Duration::from_millis(drain_ms)).await;
     stop_radar.store(true, Ordering::Relaxed);
 
     let _ = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, 9));
@@ -132,6 +143,11 @@ pub async fn run_syn_scan(
                 });
             }
         }
+    }
+
+    reports.sort_by_key(|r| (r.ip, r.port));
+    for (index, report) in reports.iter().enumerate() {
+        reporter.on_open(index + 1, report.ip, report.port);
     }
 
     Ok(reports)
@@ -173,7 +189,7 @@ fn build_syn_packet(
     let checksum = ipv4_checksum(&tcp_packet.to_immutable(), &src_ip, &dst_ip);
     tcp_packet.set_checksum(checksum);
 
-    tcp_packet.packet().len()
+    (tcp_packet.get_data_offset() as usize) * 4
 }
 
 fn has_raw_socket_privileges() -> bool {

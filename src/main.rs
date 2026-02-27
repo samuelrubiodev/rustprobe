@@ -119,7 +119,7 @@ async fn run() -> Result<()> {
 
     let reporter = LiveReporter::new(colors_enabled, show_closed_in_live);
     let reports = if cli.syn {
-        run_syn_scan(&targets, &ports, timing).await?
+        run_syn_scan(&targets, &ports, timing, &reporter).await?
     } else {
         scan_targets(
             &targets,
