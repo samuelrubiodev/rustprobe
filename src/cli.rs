@@ -43,6 +43,10 @@ pub struct Cli {
     /// Archivo de salida (compatibilidad nmap: -oN)
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
+
+    /// Realiza un escaneo Stealth SYN (Requiere privilegios de Root/Administrador)
+    #[arg(long = "syn")]
+    pub syn: bool,
 }
 
 pub fn parse_cli() -> Cli {
@@ -140,13 +144,18 @@ pub fn should_show_closed_in_live(raw_ports: &str) -> bool {
 }
 
 fn normalize_nmap_shortcuts(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    // Compatibilidad con sintaxis de nmap: "-oN archivo.txt" o "-oNarchivo.txt".
+    // Compatibilidad con sintaxis de nmap: "-oN archivo.txt", "-oNarchivo.txt" y "-sS".
     let mut normalized = Vec::new();
 
     for arg in args {
         if let Some(text) = arg.to_str() {
             if text == "-oN" {
                 normalized.push(OsString::from("--output"));
+                continue;
+            }
+
+            if text == "-sS" {
+                normalized.push(OsString::from("--syn"));
                 continue;
             }
 

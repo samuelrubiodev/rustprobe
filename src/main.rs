@@ -4,6 +4,7 @@ mod models;
 mod network;
 mod report;
 mod services;
+mod syn_scanner;
 mod update;
 mod wasm;
 
@@ -12,6 +13,7 @@ use crate::config::{ensure_default_scripts_dir, has_wasm_files};
 use crate::models::TimingProfile;
 use crate::network::{clamp_concurrency, resolve_targets, scan_targets};
 use crate::report::{paint, print_report, supports_color, write_report_file, LiveReporter};
+use crate::syn_scanner::run_syn_scan;
 use crate::update::update_scripts;
 use crate::wasm::WasmEngine;
 use anyhow::{bail, Context, Result};
@@ -97,24 +99,38 @@ async fn run() -> Result<()> {
     let colors_enabled = supports_color();
     let show_closed_in_live = should_show_closed_in_live(&cli.ports);
 
-    println!(
-        "{}: {} objetivo(s), {} puerto(s), concurrencia={}...",
-        paint("Iniciando escaneo", "1;36", colors_enabled),
-        targets.len(),
-        ports.len(),
-        timing.concurrency
-    );
+    if cli.syn {
+        println!(
+            "{}: {} objetivo(s), {} puerto(s), concurrencia={}, modo=SYN...",
+            paint("Iniciando escaneo", "1;36", colors_enabled),
+            targets.len(),
+            ports.len(),
+            timing.concurrency
+        );
+    } else {
+        println!(
+            "{}: {} objetivo(s), {} puerto(s), concurrencia={}...",
+            paint("Iniciando escaneo", "1;36", colors_enabled),
+            targets.len(),
+            ports.len(),
+            timing.concurrency
+        );
+    }
 
     let reporter = LiveReporter::new(colors_enabled, show_closed_in_live);
-    let reports = scan_targets(
-        &targets,
-        &ports,
-        scan_hostname.as_deref(),
-        timing,
-        &reporter,
-        wasm_engine.clone(),
-    )
-    .await;
+    let reports = if cli.syn {
+        run_syn_scan(&targets, &ports, timing).await?
+    } else {
+        scan_targets(
+            &targets,
+            &ports,
+            scan_hostname.as_deref(),
+            timing,
+            &reporter,
+            wasm_engine.clone(),
+        )
+        .await
+    };
 
     println!(
         "\n{}: {} puerto(s) abierto(s) detectado(s).",
