@@ -45,63 +45,6 @@ const FINAL_GRACE_MS: u64 = 3_000;
 /// bursty late replies all land before we declare the scan complete.
 const FINAL_QUIET_MS: u64 = 1_000;
 
-// ── Linux: suppress kernel RST via iptables ─────────────────────────────────
-//
-// Root cause: when  a SYN-ACK arrives for a SYN we sent via raw socket, the
-// Linux kernel has NO matching TCP state entry and IMMEDIATELY sends RST back.
-// That RST can reach a stateful remote firewall BEFORE our program reads the
-// SYN-ACK from the raw socket, causing the firewall to block further SYNs
-// from our IP – which is exactly why `apps.openportalhub.org` returns 0 ports.
-//
-// Fix: insert an iptables OUTPUT DROP rule that prevents the kernel from
-// sending RSTs on our chosen source port for the duration of the scan.
-// The rule is removed on Drop, even if the process panics.
-
-#[cfg(unix)]
-struct IptablesRstGuard {
-    sport: u16,
-    installed: bool,
-}
-
-#[cfg(unix)]
-impl IptablesRstGuard {
-    fn install(sport: u16) -> Self {
-        let installed = std::process::Command::new("iptables")
-            .args([
-                "-I", "OUTPUT",
-                "-p", "tcp",
-                "--sport", &sport.to_string(),
-                "--tcp-flags", "RST", "RST",
-                "-j", "DROP",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        Self { sport, installed }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for IptablesRstGuard {
-    fn drop(&mut self) {
-        if self.installed {
-            let _ = std::process::Command::new("iptables")
-                .args([
-                    "-D", "OUTPUT",
-                    "-p", "tcp",
-                    "--sport", &self.sport.to_string(),
-                    "--tcp-flags", "RST", "RST",
-                    "-j", "DROP",
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-    }
-}
-
 // ── Public entry point ──────────────────────────────────────────────────────
 
 pub async fn run_syn_scan(
@@ -160,20 +103,6 @@ pub async fn run_syn_scan(
         let mixed = pid ^ nanos ^ (pid.wrapping_shl(13)) ^ (nanos.wrapping_shr(7));
         32_768_u16 + (mixed % 28_232) as u16
     };
-
-    // ── 2b. Suppress kernel RST on Linux ────────────────────────────────────
-    //
-    // The Linux kernel automatically sends RST for any inbound SYN-ACK that
-    // has no matching entry in the TCP connection table (because we bypassed
-    // the kernel's TCP stack by using raw sockets).  That RST races with our
-    // detection:
-    //   SYN (us, raw) → remote port open → SYN-ACK → kernel sends RST
-    //   → remote firewall sees RST → drops subsequent SYNs from our IP
-    //
-    // We suppress it by dropping RSTs on our source port for the duration of
-    // the scan.  The RAII guard removes the rule even on panic/early return.
-    #[cfg(unix)]
-    let _rst_guard = IptablesRstGuard::install(src_port);
 
     // ── 3. Spin up the radar BEFORE the first packet leaves ─────────────────
     //
