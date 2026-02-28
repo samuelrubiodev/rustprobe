@@ -45,45 +45,44 @@ pub async fn run_syn_scan(
         return Ok(Vec::new());
     }
 
-    // ── Timing (fully derived from TimingProfile) ─────────────────────────────
+    // ── Timing (derived entirely from TimingProfile) ───────────────────────────
     //
-    // Local vs remote determines how long we must wait for replies.
-    // RFC1918/loopback → same-LAN VM, reply in <5 ms.
-    // Public IP         → WAN RTT 20–300 ms; use timing.timeout_ms as the
-    //                     worst-case reply deadline (that is what the user
-    //                     configured when choosing T1..T5).
+    // After the very last SYN we must wait at least timing.timeout_ms before
+    // calling a port "closed/filtered".  That is what the user chose when
+    // selecting T1..T5 — we respect it unconditionally (no local cap).
+    let grace_ms: u64 = timing.timeout_ms;
+
+    // Quiet window for the final drain: stop when silent for this long.
+    let quiet_ms: u64 = (timing.timeout_ms / 5).clamp(50, 1_000);
+
+    // Hard cap for the final drain (should never fire in practice).
+    let final_cap_ms: u64 = timing.timeout_ms.saturating_mul(3).max(1_000);
+
+    // ── Inter-packet gap for WAN scans ─────────────────────────────────────
+    //
+    // On LAN (RFC1918/loopback) we blast at wire speed — no WAF, no NAT
+    // throttle, and the hypervisor NIC can absorb the burst.
+    //
+    // On WAN we spread the full send phase across 20% of timeout_ms so that
+    // stateful firewalls and WAFs see a realistic packet rate instead of a
+    // 100 kpps burst that instantly triggers a block.
+    //   T3 (800 ms), 8 000 ports → 160 000 µs / 8 000 = 20 µs/pkt = 50 kpps
+    //   T5 (120 ms), 8 000 ports →  24 000 µs / 8 000 =  3 µs/pkt (capped at 1)
+    //   T1 (2500ms), 8 000 ports → 500 000 µs / 8 000 = 62 µs/pkt = 16 kpps
     let all_local = ipv4_targets.iter().all(|ip| is_rfc1918(*ip));
-
-    // How long to wait after the last SYN before the final drain.
-    // Local: cap at 200 ms (overkill for a hypervisor NIC).
-    // Remote: full timing.timeout_ms — any reply arriving later cannot be
-    //         captured regardless, so there is no point waiting longer.
-    let grace_ms: u64 = if all_local {
-        timing.timeout_ms.min(200)
+    let total_syns_per_pass = (ipv4_targets.len() * ports.len()).max(1);
+    let ipt_us: u64 = if all_local {
+        0 // wire speed on LAN
     } else {
-        timing.timeout_ms
+        let budget_us = (timing.timeout_ms * 1_000) / 5; // 20% of timeout
+        (budget_us / total_syns_per_pass as u64).max(1)
     };
-
-    // Quiet window for drains: stop waiting once silent for this long.
-    // Shorter than grace_ms so we exit quickly after the last reply.
-    let quiet_ms: u64 = (timing.timeout_ms / 3).clamp(30, 300);
-
-    // Inter-pass drain cap: keep it tight so passes don't stall.
-    let pass_cap_ms: u64 = quiet_ms * 2;
-
-    // Final drain cap: generous — catches any late stragglers.
-    let final_cap_ms: u64 = grace_ms + quiet_ms * 3;
 
     // ── Wire-speed send with ENOBUFS back-off ────────────────────────────────
     //
-    // We send packets as fast as the kernel allows (zero sleep by default).
-    // `throttle_us` starts at 0 (unlimited).  When the kernel TX queue is
-    // full (ENOBUFS) we double the throttle (multiplicative back-off, same
-    // as TCP slow-start).  After each successful send we shave 2% off the
-    // throttle (linear recovery) until it returns to 0.
-    //
-    // This means:  no overhead on fast paths (LAN, well-provisioned VMs),
-    //              automatic graceful degradation on congested paths.
+    // `throttle_us` starts at 0.  On ENOBUFS it doubles (floor 1 ms, cap 50 ms).
+    // Each clean send sheds 2% until it returns to 0.
+    // When non-zero it overrides ipt_us (congestion takes priority).
     let mut throttle_us: u64 = 0;
 
     // ── Transport channel ─────────────────────────────────────────────────────
@@ -185,12 +184,17 @@ pub async fn run_syn_scan(
             for &dst_port in ports {
                 build_syn_packet(src_ip, dst_ip, src_port, dst_port, &mut buf);
 
-                // Throttle only when ENOBUFS has forced us to slow down.
-                // When throttle_us == 0 (the common case) this branch is free.
-                if throttle_us > 0 {
-                    std::thread::sleep(Duration::from_micros(throttle_us));
-                    // Linear recovery: shed 2% of throttle per packet sent.
+                // Normal inter-packet pacing (WAN only; 0 on LAN).
+                // ENOBUFS throttle overrides when active.
+                let sleep_us = if throttle_us > 0 {
+                    let t = throttle_us;
                     throttle_us = throttle_us.saturating_sub(throttle_us / 50 + 1);
+                    t
+                } else {
+                    ipt_us
+                };
+                if sleep_us > 0 {
+                    std::thread::sleep(Duration::from_micros(sleep_us));
                 }
 
                 // Send; back off on ENOBUFS (kernel TX queue full).
@@ -216,17 +220,15 @@ pub async fn run_syn_scan(
             }
         }
 
-        // Drain replies already sitting in the channel before the next SYN wave.
-        // Keep the window tight (pass_cap_ms) so passes don't stall waiting
-        // for slow replies — the grace sleep below handles those.
-        drain_channel(
-            &hit_rx,
-            &mut open_set,
-            quiet_ms,
-            pass_cap_ms,
-            reporter,
-            &mut hits_reported,
-        );
+        // Non-blocking flush: drain everything already queued in the channel
+        // without any waiting.  All real waiting happens in the grace sleep
+        // below.  This keeps passes back-to-back (no stalling between waves).
+        while let Ok(hit) = hit_rx.try_recv() {
+            if open_set.insert(hit) {
+                hits_reported += 1;
+                reporter.on_open(hits_reported, IpAddr::V4(hit.0), hit.1);
+            }
+        }
     }
 
     // ── Grace period ──────────────────────────────────────────────────────────
