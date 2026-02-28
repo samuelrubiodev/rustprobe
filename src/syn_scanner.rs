@@ -18,31 +18,32 @@ use tokio::time::sleep;
 const RX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Number of SYN packets to send before yielding to the OS network stack.
-/// Keeping this ≤ 64 prevents ENOBUFS on most kernels/NICs.
-const BURST_SIZE: usize = 64;
+/// 32 is conservative – prevents ENOBUFS on VMs with limited NIC queues.
+const BURST_SIZE: usize = 32;
 
-/// Pause between bursts (ms).  2 ms lets the NIC queue drain without making
-/// an 8 000-port scan noticeably slower (~250 ms overhead total).
-const BURST_PAUSE_MS: u64 = 2;
+/// Pause between bursts (ms).  4 ms lets the NIC queue drain without making
+/// an 8 000-port scan noticeably slower (~1 s overhead total).
+const BURST_PAUSE_MS: u64 = 4;
 
-/// Adaptive drain – stop early if no new hit arrives within this window.
-/// 200 ms is generous for LAN; remote SYN-ACKs also arrive well within this.
-const DRAIN_QUIET_MS: u64 = 200;
+/// Quiet-window for inter-pass drains.  400 ms catches even lightly-loaded
+/// remote services that take a few hundred ms to respond.
+const DRAIN_QUIET_MS: u64 = 400;
 
-/// Hard cap for the drain phase regardless of how frequent the hits are.
-/// Keeps the total scan time bounded even on very noisy networks.
+/// Hard cap for EACH inter-pass drain.  1 500 ms is enough time to drain
+/// all pending SYN-ACKs from a full 8 000-port pass on any network.
+const DRAIN_PASS_MAX_MS: u64 = 1_500;
+
+/// Hard cap for the FINAL drain (after the grace sleep).
 const DRAIN_MAX_MS: u64 = 2_000;
 
 /// Max back-off retries when the kernel returns ENOBUFS.
 const ENOBUFS_RETRIES: u8 = 5;
 
-/// Mandatory sleep AFTER the sender loop finishes and BEFORE starting the
-/// final adaptive drain.  External SYN-ACKs travelling through NAT can take
-/// 1–2 s; without this floor we close the receiver before they arrive.
+/// Mandatory async sleep AFTER all passes and their drains, BEFORE the final
+/// drain.  Gives in-flight SYN-ACKs from remote targets time to arrive.
 const FINAL_GRACE_MS: u64 = 3_000;
 
-/// Quiet-window for the FINAL drain (after the grace period).  1 s lets
-/// bursty late replies all land before we declare the scan complete.
+/// Quiet-window for the FINAL drain (after the grace period).
 const FINAL_QUIET_MS: u64 = 1_000;
 
 // ── Public entry point ──────────────────────────────────────────────────────
@@ -153,16 +154,51 @@ pub async fn run_syn_scan(
     });
 
     // ── 4. Cache source IPs once per target ─────────────────────────────────
-    let src_ips: Vec<Option<Ipv4Addr>> =
-        ipv4_targets.iter().map(|&dst| get_source_ip(dst)).collect();
+    //
+    // Pista 1 audit: if get_source_ip returns None for a target, every port
+    // on that target is silently skipped.  We now log a visible warning to
+    // stderr so the operator knows packets are NOT being sent.
+    // We also reject 0.0.0.0: the kernel can return it when routing is not
+    // configured, and using it as pseudo-header source gives a wrong TCP
+    // checksum that most remote stacks will silently drop.
+    let src_ips: Vec<Option<Ipv4Addr>> = ipv4_targets
+        .iter()
+        .map(|&dst| {
+            match get_source_ip(dst) {
+                Some(ip) if ip.is_unspecified() => {
+                    eprintln!(
+                        "[SYN] WARN: routing lookup for {} returned 0.0.0.0 \
+                         – no route to host, skipping target",
+                        dst
+                    );
+                    None
+                }
+                None => {
+                    eprintln!(
+                        "[SYN] WARN: could not determine source IP for {} \
+                         (no route?), skipping target",
+                        dst
+                    );
+                    None
+                }
+                ok => ok,
+            }
+        })
+        .collect();
+
+    // Abort early if we cannot route to ANY target.
+    if src_ips.iter().all(|s| s.is_none()) {
+        bail!("No se pudo determinar la IP de origen para ningún objetivo. \
+               ¿Hay ruta de red?");
+    }
 
     // ── 5. Send SYN packets in paced bursts ─────────────────────────────────
     //
     // Retry strategy: full passes instead of N consecutive retries per port.
     // Spreading retries evenly reduces burst pressure and improves coverage.
     let max_retries = timing.retries.max(1) as usize;
-    let mut sent_count: usize = 0;
     let mut buf = [0u8; 20]; // reusable 20-byte packet buffer
+    let mut enobufs_total: u32 = 0;
 
     // open_set is shared across passes and the inter-pass mini-drain.
     let mut open_set: HashSet<(Ipv4Addr, u16)> = HashSet::new();
@@ -170,7 +206,12 @@ pub async fn run_syn_scan(
     // all drain calls so on_open indices are globally sequential).
     let mut hits_reported: usize = 0;
 
-    for attempt in 0..=max_retries {
+    for _attempt in 0..=max_retries {
+        // ── Bug fix: reset per-pass counter so burst boundaries are aligned
+        // correctly on every pass (pass N used to inherit the offset from
+        // pass N-1, causing the first burst of each pass to be irregular).
+        let mut pass_sent: usize = 0;
+
         for (idx, &dst_ip) in ipv4_targets.iter().enumerate() {
             let Some(src_ip) = src_ips[idx] else {
                 continue;
@@ -191,6 +232,7 @@ pub async fn run_syn_scan(
                                 && enobufs_left > 0 =>
                         {
                             enobufs_left -= 1;
+                            enobufs_total += 1;
                             // Give the kernel 5 ms to drain its send queue.
                             std::thread::sleep(std::time::Duration::from_millis(5));
                         }
@@ -198,26 +240,44 @@ pub async fn run_syn_scan(
                     }
                 }
 
-                sent_count += 1;
+                pass_sent += 1;
 
                 // Pacing: after every burst, hand the NIC hardware time to
                 // drain its TX queue.  std::thread::sleep is intentional here:
-                // the entire send loop is synchronous (send_to blocks), so a
-                // tokio async yield would not add any benefit and could be
-                // less precise on short durations.
-                if sent_count % BURST_SIZE == 0 {
+                // the entire send loop is synchronous (send_to blocks).
+                if pass_sent % BURST_SIZE == 0 {
                     std::thread::sleep(Duration::from_millis(BURST_PAUSE_MS));
                 }
             }
         }
 
-        // Between retry passes: run a mini adaptive drain so SYN-ACKs from
-        // the current pass are collected before we flood the wire again.
-        // Uses the same quiet-window logic as the final drain (200 ms quiet
-        // or 500 ms hard cap), but does NOT drop hit_rx – scanning continues.
-        if attempt < max_retries {
-            drain_adaptive(&hit_rx, &mut open_set, DRAIN_QUIET_MS, 500, reporter, &mut hits_reported);
-        }
+        // ── Drain after EVERY pass (including the last one) ─────────────────
+        //
+        // BUG FIX: The previous code only ran a drain for `attempt < max_retries`,
+        // skipping the drain after the final pass.  This caused pass-2 SYN-ACKs
+        // to sit uncollected in hit_rx for the entire 3-second grace sleep,
+        // making them appear at t≈4.6s instead of t≈1s.
+        //
+        // Now we drain after every pass.  Inter-pass drains use DRAIN_QUIET_MS
+        // (400 ms) and DRAIN_PASS_MAX_MS (1 500 ms) to ensure all in-flight
+        // responses – including from moderately-loaded remote services – are
+        // captured before the next packet wave or the grace sleep.
+        drain_adaptive(
+            &hit_rx,
+            &mut open_set,
+            DRAIN_QUIET_MS,
+            DRAIN_PASS_MAX_MS,
+            reporter,
+            &mut hits_reported,
+        );
+    }
+
+    if enobufs_total > 0 {
+        eprintln!(
+            "[SYN] WARN: ENOBUFS se repitió {} veces durante el escaneo. \
+             Considera reducir BURST_SIZE o aumentar BURST_PAUSE_MS.",
+            enobufs_total
+        );
     }
 
     // ── 6. Mandatory grace period + final adaptive drain ───────────────────
