@@ -9,18 +9,13 @@ use pnet::transport::{
 };
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
-// ── Tuning constants ────────────────────────────────────────────────────────
-
-/// Kernel RX socket buffer.  64 KB overflows on any real scan; 4 MB is safe.
+// 4 MB RX ring so a burst of SYN-ACKs never overflows the kernel buffer.
 const RX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-/// Max back-off retries when the kernel returns ENOBUFS.
-const ENOBUFS_RETRIES: u8 = 5;
-
-// ── Public entry point ──────────────────────────────────────────────────────
+// ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run_syn_scan(
     targets: &[IpAddr],
@@ -46,63 +41,81 @@ pub async fn run_syn_scan(
     if ipv4_targets.is_empty() {
         bail!("El escaneo SYN actualmente solo soporta objetivos IPv4");
     }
-
     if ports.is_empty() {
         return Ok(Vec::new());
     }
 
-    // ── 0. Dynamic timing parameters ────────────────────────────────────────
+    // ── Topology detection ────────────────────────────────────────────────────
     //
-    // All tuning constants are derived from the user-supplied TimingProfile so
-    // that -T1/-T3 are conservative while -T4/-T5 are as fast as the link
-    // and remote stack allow.
-    // burst_size and burst_pause_ms are mutable so ENOBUFS can apply
-    // AIMD-style back-pressure: halve the burst, double the pause.
-    // Initial cap of 512 keeps the NIC TX queue from flooding even on -T5.
-    let mut burst_size     = timing.concurrency.clamp(32, 512) as usize;
-    let mut burst_pause_ms = if timing.concurrency > 500 { 2u64 } else { 5u64 };
-    let final_grace_ms   = timing.timeout_ms.max(300);
-    let final_quiet_ms   = (timing.timeout_ms / 2).clamp(100, 500);
-    let drain_quiet_ms   = (timing.timeout_ms / 3).clamp(50, 200);
-    let drain_pass_max_ms = timing.timeout_ms.max(500);
-    let drain_max_ms     = timing.timeout_ms.saturating_mul(2).max(1000);
+    // Whether all targets sit on the local network (RFC 1918 / loopback)
+    // determines the RTT estimate.  Local NICs respond in <5 ms; a WAN hop
+    // through a NAT + firewall can be 100–300 ms.  Every timeout we derive
+    // below is proportional to this estimate, so the scan is neither lazy on
+    // LAN nor impatient on the Internet.
+    let all_local = ipv4_targets.iter().all(|ip| is_rfc1918(*ip));
 
-    // ── 1. Transport channel ────────────────────────────────────────────────
+    // Conservative RTT estimate.
+    //   Local  → 5 ms  (covers any VM hypervisor jitter)
+    //   Remote → half of timing.timeout_ms, floor 50 ms
+    let rtt_ms: u64 = if all_local {
+        5
+    } else {
+        (timing.timeout_ms / 2).max(50)
+    };
+
+    // How long to sleep after the LAST SYN before starting the final drain.
+    // 3× RTT gives even the slowest in-flight SYN-ACK time to arrive.
+    let grace_ms: u64 = rtt_ms.saturating_mul(3).max(if all_local { 50 } else { 300 });
+
+    // Quiet window: if no new hit arrives within this time the drain is done.
+    let quiet_ms: u64 = rtt_ms.max(30);
+
+    // Hard cap for the inter-pass drain (prevents it stalling on a retry loop).
+    let pass_cap_ms: u64 = rtt_ms.saturating_mul(4).max(200);
+
+    // Hard cap for the final drain.
+    let final_cap_ms: u64 = rtt_ms.saturating_mul(8).max(500);
+
+    // ── AIMD rate control ─────────────────────────────────────────────────────
     //
-    // Layer4/Ipv4/Tcp: we write/read raw TCP headers; the kernel handles IP.
-    // A 4 MB RX buffer handles bursts of SYN-ACKs without loss.
+    // We pace sends using a deadline-per-packet model rather than burst+sleep.
+    // `current_pps` is the live send rate (packets / second).
+    //   On ENOBUFS (kernel TX queue full): halve it  (multiplicative decrease).
+    //   Every 512 clean sends: nudge it +5% toward target_pps              (additive increase).
+    //
+    //   This is exactly TCP AIMD: aggressive reaction to congestion, gentle
+    //   probe when things are going well.
+    let target_pps: u64 = timing.concurrency.max(1) as u64;
+    let mut current_pps: u64 = target_pps;
+    let mut good_streak: u64 = 0;
+
+    // ── Transport channel ─────────────────────────────────────────────────────
     let protocol = Layer4(Ipv4(IpNextHeaderProtocols::Tcp));
     let (mut tx, mut rx) = transport_channel(RX_BUFFER_BYTES, protocol)
         .context("No se pudo crear canal de transporte TCP (¿privilegios insuficientes?)")?;
 
-    // ── 2. Fixed source port ────────────────────────────────────────────────
+    // ── Fixed source port ─────────────────────────────────────────────────────
     //
-    // A stable, non-zero source port is MANDATORY for external scans:
-    // every SYN in this session carries the SAME sport so the NAT table
-    // keeps a single state entry and routes ALL SYN-ACK replies back to us.
-    //
-    // We derive it once by XOR-mixing the PID with subsecond nanos so that
-    // concurrent rustprobe instances rarely collide and the port is
-    // unpredictable (no `rand` dependency required).
+    // Every SYN in this session shares the same source port so the NAT/firewall
+    // keeps a single conntrack entry and routes all SYN-ACKs back to us.
+    // Derived from PID × subsecond nanos to avoid collisions between
+    // concurrent scanner instances without needing a `rand` dependency.
     let src_port: u16 = {
         let pid   = std::process::id() as u64;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64)
             .unwrap_or(0xDEAD_BEEF);
-        // Keep the port in the unprivileged ephemeral range [32 768, 60 999].
         let mixed = pid ^ nanos ^ (pid.wrapping_shl(13)) ^ (nanos.wrapping_shr(7));
         32_768_u16 + (mixed % 28_232) as u16
     };
 
-    // ── 3. Spin up the radar BEFORE the first packet leaves ─────────────────
+    // ── Radar thread ──────────────────────────────────────────────────────────
     //
-    // pnet 0.34's next() is a blocking call with no built-in timeout.
-    // We use an mpsc channel instead:
-    //   • radar thread sends every SYN-ACK hit to `hit_tx`
-    //   • main thread drains `hit_rx` with recv_timeout(drain_window)
-    //   • when main drops `hit_rx` the channel closes; the thread's next
-    //     send() returns Err and the thread exits cleanly.
+    // Spawned BEFORE the first SYN leaves so we never miss an early reply.
+    // Forwards every (src_ip, src_port) tuple of SYN-ACK packets aimed at
+    // our source port through an mpsc channel to the main thread.
+    // Exits cleanly when the channel receiver is dropped at end of scope.
     let valid_targets: HashSet<Ipv4Addr> = ipv4_targets.iter().cloned().collect();
     let (hit_tx, hit_rx) = std::sync::mpsc::channel::<(Ipv4Addr, u16)>();
 
@@ -114,189 +127,148 @@ pub async fn run_syn_scan(
                     let flags = pkt.get_flags();
                     let is_syn_ack = (flags & (TcpFlags::SYN | TcpFlags::ACK))
                         == (TcpFlags::SYN | TcpFlags::ACK);
-
-                    // Guard 1: reply must carry SYN+ACK.
-                    // Guard 2: dport must equal OUR sport – filters other apps.
-                    // Guard 3: source IP must be one of our targets.
                     if is_syn_ack && pkt.get_destination() == src_port {
                         if let IpAddr::V4(v4) = src_addr {
                             if valid_targets.contains(&v4) {
-                                // Channel closed → main is done → exit thread.
                                 if hit_tx.send((v4, pkt.get_source())).is_err() {
-                                    break;
+                                    break; // receiver dropped → main is done
                                 }
                             }
                         }
                     }
                 }
-                // Transient errors (EINTR, EAGAIN) must NOT kill the thread.
-                // Only exit on EBADF / other fatal errors that indicate the
-                // socket itself is gone.
                 Err(e) => {
                     use std::io::ErrorKind::*;
                     match e.kind() {
-                        Interrupted | WouldBlock | TimedOut => continue, // retry
-                        _ => break, // fatal: socket closed or unrecoverable
+                        Interrupted | WouldBlock | TimedOut => continue,
+                        _ => break, // fatal socket error
                     }
                 }
             }
         }
     });
 
-    // ── 4. Cache source IPs once per target ─────────────────────────────────
+    // ── Source IP cache ───────────────────────────────────────────────────────
     //
-    // Pista 1 audit: if get_source_ip returns None for a target, every port
-    // on that target is silently skipped.  We now log a visible warning to
-    // stderr so the operator knows packets are NOT being sent.
-    // We also reject 0.0.0.0: the kernel can return it when routing is not
-    // configured, and using it as pseudo-header source gives a wrong TCP
-    // checksum that most remote stacks will silently drop.
+    // Resolve once per target using a connected UDP socket (no traffic sent).
+    // Targets that cannot be routed are skipped with a visible warning.
     let src_ips: Vec<Option<Ipv4Addr>> = ipv4_targets
         .iter()
-        .map(|&dst| {
-            match get_source_ip(dst) {
-                Some(ip) if ip.is_unspecified() => {
-                    eprintln!(
-                        "[SYN] WARN: routing lookup for {} returned 0.0.0.0 \
-                         – no route to host, skipping target",
-                        dst
-                    );
-                    None
-                }
-                None => {
-                    eprintln!(
-                        "[SYN] WARN: could not determine source IP for {} \
-                         (no route?), skipping target",
-                        dst
-                    );
-                    None
-                }
-                ok => ok,
+        .map(|&dst| match get_source_ip(dst) {
+            Some(ip) if ip.is_unspecified() => {
+                eprintln!("[SYN] WARN: no route to {dst}, skipping");
+                None
             }
+            None => {
+                eprintln!("[SYN] WARN: could not determine source IP for {dst}, skipping");
+                None
+            }
+            ok => ok,
         })
         .collect();
 
-    // Abort early if we cannot route to ANY target.
     if src_ips.iter().all(|s| s.is_none()) {
-        bail!("No se pudo determinar la IP de origen para ningún objetivo. \
-               ¿Hay ruta de red?");
+        bail!("No se pudo determinar la IP de origen para ningún objetivo. ¿Hay ruta de red?");
     }
 
-    // ── 5. Send SYN packets in paced bursts ─────────────────────────────────
+    // ── Send loop ─────────────────────────────────────────────────────────────
     //
-    // Retry strategy: full passes instead of N consecutive retries per port.
-    // Spreading retries evenly reduces burst pressure and improves coverage.
-    let max_retries = timing.retries.max(1) as usize;
-    let mut buf = [0u8; 24]; // reusable 24-byte packet buffer (20 base + 4 MSS option)
-    let mut enobufs_total: u32 = 0;
-
-    // open_set is shared across passes and the inter-pass mini-drain.
+    // Deadline-based rate limiting: instead of sleep-after-N-packets we
+    // track exactly when the next packet should go out.  Sleeping only the
+    // delta between now and that deadline gives sub-millisecond pacing
+    // accuracy with no accumulation of drift across thousands of ports.
+    //
+    // Multiple passes (retries) ensure reliability: ports that got a dropped
+    // SYN on pass 1 are retried on pass 2, etc.
+    let num_passes = timing.retries.max(1) as usize + 1;
+    let mut buf = [0u8; 24]; // 20-byte TCP base + 4-byte MSS option
     let mut open_set: HashSet<(Ipv4Addr, u16)> = HashSet::new();
-    // Counter tracks how many hits have been printed so far (shared across
-    // all drain calls so on_open indices are globally sequential).
     let mut hits_reported: usize = 0;
+    let mut next_send = Instant::now();
 
-    for _attempt in 0..=max_retries {
-        // ── Bug fix: reset per-pass counter so burst boundaries are aligned
-        // correctly on every pass (pass N used to inherit the offset from
-        // pass N-1, causing the first burst of each pass to be irregular).
-        let mut pass_sent: usize = 0;
-
+    for pass in 0..num_passes {
         for (idx, &dst_ip) in ipv4_targets.iter().enumerate() {
-            let Some(src_ip) = src_ips[idx] else {
-                continue;
-            };
+            let Some(src_ip) = src_ips[idx] else { continue; };
 
             for &dst_port in ports {
-                // Build a fresh SYN into `buf` (fill(0) called inside).
                 build_syn_packet(src_ip, dst_ip, src_port, dst_port, &mut buf);
 
-                // Back off on ENOBUFS instead of silently dropping packets.
-                let mut enobufs_left = ENOBUFS_RETRIES;
+                // Wait until the rate-limit deadline before sending.
+                let now = Instant::now();
+                if now < next_send {
+                    std::thread::sleep(next_send - now);
+                }
+
+                // Attempt to send; back off with AIMD on kernel congestion.
+                let mut retries_left = 8u8;
                 loop {
                     let pkt = TcpPacket::new(&buf).expect("buffer TCP inválido");
                     match tx.send_to(pkt, IpAddr::V4(dst_ip)) {
-                        Ok(_) => break,
+                        Ok(_) => {
+                            good_streak += 1;
+                            // Additive increase: every 512 clean sends nudge
+                            // current_pps 5% closer to the original target.
+                            if good_streak % 512 == 0 && current_pps < target_pps {
+                                current_pps =
+                                    (current_pps + (target_pps / 20).max(1)).min(target_pps);
+                            }
+                            break;
+                        }
                         Err(e)
                             if e.raw_os_error() == Some(enobufs_code())
-                                && enobufs_left > 0 =>
+                                && retries_left > 0 =>
                         {
-                            enobufs_left -= 1;
-                            enobufs_total += 1;
-                            // AIMD back-pressure: halve burst, double pause (capped).
-                            // This converges to a stable send rate that the kernel
-                            // can sustain without overflowing the NIC TX queue.
-                            burst_size = (burst_size / 2).max(32);
-                            burst_pause_ms = (burst_pause_ms * 2).min(50);
-                            // Give the kernel time to drain before retrying.
-                            std::thread::sleep(std::time::Duration::from_millis(burst_pause_ms));
+                            retries_left -= 1;
+                            good_streak = 0;
+                            // Multiplicative decrease: halve the rate, floor 50 pps.
+                            current_pps = (current_pps / 2).max(50);
+                            // Sleep one inter-packet interval at the new reduced
+                            // rate to let the kernel TX queue drain.
+                            std::thread::sleep(Duration::from_micros(
+                                (1_000_000 / current_pps).min(20_000),
+                            ));
                         }
-                        Err(_) => break, // unrecoverable – skip port
+                        Err(_) => break, // unrecoverable; skip this port
                     }
                 }
 
-                pass_sent += 1;
-
-                // Pacing: after every burst, hand the NIC hardware time to
-                // drain its TX queue.  std::thread::sleep is intentional here:
-                // the entire send loop is synchronous (send_to blocks).
-                if pass_sent % burst_size == 0 {
-                    std::thread::sleep(Duration::from_millis(burst_pause_ms));
-                }
+                // Advance the deadline by one inter-packet interval so the
+                // next iteration naturally waits the right amount.
+                next_send = Instant::now()
+                    + Duration::from_micros(1_000_000 / current_pps.max(1));
             }
         }
 
-        // ── Drain after EVERY pass (including the last one) ─────────────────
-        //
-        // BUG FIX: The previous code only ran a drain for `attempt < max_retries`,
-        // skipping the drain after the final pass.  This caused pass-2 SYN-ACKs
-        // to sit uncollected in hit_rx for the entire 3-second grace sleep,
-        // making them appear at t≈4.6s instead of t≈1s.
-        //
-        // Now we drain after every pass.  Inter-pass drains use DRAIN_QUIET_MS
-        // (400 ms) and DRAIN_PASS_MAX_MS (1 500 ms) to ensure all in-flight
-        // responses – including from moderately-loaded remote services – are
-        // captured before the next packet wave or the grace sleep.
-        drain_adaptive(
+        // Drain replies accumulated during this pass before the next wave.
+        // On the final pass the grace sleep below will catch stragglers.
+        let _ = pass; // suppress unused-variable warning in release mode
+        drain_channel(
             &hit_rx,
             &mut open_set,
-            drain_quiet_ms,
-            drain_pass_max_ms,
+            quiet_ms,
+            pass_cap_ms,
             reporter,
             &mut hits_reported,
         );
     }
 
-    if enobufs_total > 0 {
-        eprintln!(
-            "[SYN] WARN: ENOBUFS se repitió {} veces durante el escaneo. \
-             El control de congestión adaptativo (AIMD) ajustó el ritmo de envío automáticamente. \
-             Burst final: {} paquetes / {} ms pausa.",
-            enobufs_total, burst_size, burst_pause_ms
-        );
-    }
-
-    // ── 6. Mandatory grace period + final adaptive drain ───────────────────
+    // ── Grace period ──────────────────────────────────────────────────────────
     //
-    // WHY the explicit sleep:
-    //   Remote SYN-ACKs travelling through NAT can arrive 500 ms – 2+ s after
-    //   the last SYN is sent.  Without this floor the adaptive drain's quiet
-    //   window (DRAIN_QUIET_MS = 200 ms) fires before ANY external reply lands,
-    //   producing 0 open ports on every remote target.
-    //
-    //   We use tokio::time::sleep (async await) so the tokio worker thread is
-    //   freed during the wait – the radar thread continues receiving and
-    //   enqueuing SYN-ACKs into hit_tx the whole time.
-    sleep(Duration::from_millis(final_grace_ms)).await;
+    // Async sleep (tokio) frees the worker thread while the radar keeps
+    // receiving.  Gives in-flight SYN-ACKs time to arrive before the final drain.
+    sleep(Duration::from_millis(grace_ms)).await;
 
-    // Now drain whatever accumulated in the channel, plus any stragglers that
-    // still trickle in.  FINAL_QUIET_MS (1 s) is wide enough to catch bursts
-    // of late replies; DRAIN_MAX_MS is the absolute hard cap.
-    drain_adaptive(&hit_rx, &mut open_set, final_quiet_ms, drain_max_ms, reporter, &mut hits_reported);
-    // hit_rx dropped at end of scope → channel closed → radar thread exits.
+    drain_channel(
+        &hit_rx,
+        &mut open_set,
+        quiet_ms,
+        final_cap_ms,
+        reporter,
+        &mut hits_reported,
+    );
+    // Dropping hit_rx closes the channel → radar thread exits cleanly.
 
-    // ── 7. Build report ─────────────────────────────────────────────────────
-    // Ports were already printed in real-time; just build the return value.
+    // ── Build report ──────────────────────────────────────────────────────────
     let mut reports: Vec<PortReport> = Vec::new();
     for &ip in &ipv4_targets {
         for &port in ports {
@@ -313,18 +285,14 @@ pub async fn run_syn_scan(
     }
 
     reports.sort_by_key(|r| (r.ip, r.port));
-
     Ok(reports)
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Adaptive drain: collect hits from `rx` until no new hit arrives within
-/// `quiet_ms` milliseconds, or `max_ms` milliseconds have elapsed in total.
-///
-/// Each **new** hit (not a duplicate) is printed immediately via `reporter`.
-/// Can be called multiple times sharing the same `rx`, `set`, and `counter`.
-fn drain_adaptive(
+/// Receive hits until quiet for `quiet_ms` OR `max_ms` total have elapsed.
+/// Deduplicates and calls `reporter.on_open` for each genuinely new port.
+fn drain_channel(
     rx: &std::sync::mpsc::Receiver<(Ipv4Addr, u16)>,
     set: &mut HashSet<(Ipv4Addr, u16)>,
     quiet_ms: u64,
@@ -333,50 +301,64 @@ fn drain_adaptive(
     counter: &mut usize,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
-    let hard_deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
-    let mut quiet_deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(quiet_ms);
+    let hard  = Instant::now() + Duration::from_millis(max_ms);
+    let mut quiet = Instant::now() + Duration::from_millis(quiet_ms);
 
     loop {
-        let now = std::time::Instant::now();
-        if now >= hard_deadline {
-            break;
-        }
-        // Use the sooner of the two deadlines as the recv timeout.
-        let timeout = quiet_deadline.min(hard_deadline).saturating_duration_since(now);
+        let now = Instant::now();
+        if now >= hard { break; }
+        let timeout = quiet.min(hard).saturating_duration_since(now);
         match rx.recv_timeout(timeout) {
             Ok(hit) => {
-                // Only report and count genuinely new ports.
                 if set.insert(hit) {
                     *counter += 1;
                     reporter.on_open(*counter, IpAddr::V4(hit.0), hit.1);
                 }
-                // Reset the quiet window – traffic is still flowing.
-                quiet_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(quiet_ms);
+                quiet = Instant::now() + Duration::from_millis(quiet_ms);
             }
-            Err(RecvTimeoutError::Timeout) => {
-                // Quiet window expired first: no traffic for quiet_ms.
-                break;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout)      => break,
+            Err(RecvTimeoutError::Disconnected)  => break,
         }
     }
 }
-#[inline]
-fn enobufs_code() -> i32 {
-    if cfg!(unix) {
-        105 // ENOBUFS (Linux)
-    } else if cfg!(windows) {
-        10055 // WSAENOBUFS
-    } else {
-        -1
-    }
+
+/// Build a SYN packet into `buf` (24 bytes = 20-byte TCP header + 4-byte MSS).
+///
+/// MSS 1460 (Ethernet standard) is included so the packet looks identical to
+/// one emitted by a real OS kernel.  WAFs and stateful firewalls routinely
+/// drop option-less SYNs as scanner fingerprints.
+fn build_syn_packet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    buf: &mut [u8; 24],
+) {
+    buf.fill(0);
+    let mut pkt = MutableTcpPacket::new(buf).expect("buffer TCP inválido");
+    // Randomise the sequence number per packet to reduce fingerprinting.
+    let seq = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mss = TcpOption::mss(1460);
+    pkt.set_source(src_port);
+    pkt.set_destination(dst_port);
+    pkt.set_sequence(seq);
+    pkt.set_acknowledgement(0);
+    pkt.set_data_offset(6); // 6 × 4 = 24 bytes
+    pkt.set_reserved(0);
+    pkt.set_flags(TcpFlags::SYN);
+    pkt.set_window(64_240); // standard Linux advertised window
+    pkt.set_urgent_ptr(0);
+    pkt.set_options(&[mss]);
+    pkt.set_checksum(0); // must be zero before ipv4_checksum
+    let cs = ipv4_checksum(&pkt.to_immutable(), &src_ip, &dst_ip);
+    pkt.set_checksum(cs);
 }
 
-/// Determines the local IP the OS would use to reach `target`.
-/// Uses a connected UDP socket – no actual packets are sent.
+/// Returns the source IP the OS routing table would use to reach `target`.
+/// A connected UDP socket is used — zero bytes are actually transmitted.
 fn get_source_ip(target: Ipv4Addr) -> Option<Ipv4Addr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect((target, 80)).ok()?;
@@ -386,73 +368,37 @@ fn get_source_ip(target: Ipv4Addr) -> Option<Ipv4Addr> {
     }
 }
 
-/// Builds a minimal, correctly-formed SYN TCP packet into `buf`.
-///
-/// Correctness checklist:
-/// - `set_checksum(0)` is called **before** `ipv4_checksum` (the checksum
-///   computation treats the checksum field as zero).
-/// - `ipv4_checksum` is called **after** every other field has been written.
-/// - `src_port` is fixed for the whole scan so NAT returns work.
-/// - `window` of 64 240 matches the Linux kernel default – looks normal to
-///   stateful firewalls.  A value of 1 024 is suspicious and often filtered.
-/// - `data_offset` 6 → 24-byte header (MSS option included) → fits exactly in `buf`.
-/// - MSS 1460 is the standard Ethernet MTU-derived value; its presence prevents
-///   strict WAFs from dropping the SYN as a scanner fingerprint (real OSes
-///   always advertise MSS in the initial SYN).
-fn build_syn_packet(
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
-    src_port: u16,
-    dst_port: u16,
-    buf: &mut [u8; 24],
-) {
-    // Zero out on every call so reusing the buffer is safe.
-    buf.fill(0);
-
-    let mut pkt = MutableTcpPacket::new(buf).expect("buffer TCP inválido");
-
-    // Per-packet sequence randomisation looks less scanner-like.
-    let seq = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-
-    // Standard MSS for Ethernet (MTU 1500 − 20 IP − 20 TCP = 1460).
-    // Including this option is mandatory for WAF evasion: any stack that
-    // omits MSS in a SYN is trivially identified as a scanner.
-    let mss = TcpOption::mss(1460);
-
-    pkt.set_source(src_port);
-    pkt.set_destination(dst_port);
-    pkt.set_sequence(seq);
-    pkt.set_acknowledgement(0);
-    pkt.set_data_offset(6); // 6 × 4 = 24 bytes (20 base + 4 MSS option)
-    pkt.set_reserved(0);
-    pkt.set_flags(TcpFlags::SYN);
-    pkt.set_window(64_240); // realistic Linux default
-    pkt.set_urgent_ptr(0);
-    pkt.set_options(&[mss]);
-    pkt.set_checksum(0); // MUST be zero before computing the real checksum
-
-    // ipv4_checksum uses a TCP pseudo-header (src/dst IP, proto, TCP length).
-    // Call it AFTER all other fields are set.
-    let cs = ipv4_checksum(&pkt.to_immutable(), &src_ip, &dst_ip);
-    pkt.set_checksum(cs);
+/// True if `ip` is an RFC 1918 private address, loopback, or link-local.
+/// Used to detect local-network scans and apply more aggressive timing.
+fn is_rfc1918(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    matches!(
+        o,
+        [10, ..]
+            | [172, 16..=31, ..]
+            | [192, 168, ..]
+            | [127, ..]
+            | [169, 254, ..]
+    )
 }
 
-// ── Privilege checks ─────────────────────────────────────────────────────────
+/// Platform ENOBUFS error code (kernel TX queue full).
+#[inline]
+fn enobufs_code() -> i32 {
+    if cfg!(unix) { 105 } else if cfg!(windows) { 10055 } else { -1 }
+}
+
+// ── Privilege checks ──────────────────────────────────────────────────────────
 
 fn has_raw_socket_privileges() -> bool {
     #[cfg(unix)]
     {
         nix::unistd::Uid::effective().is_root()
     }
-
     #[cfg(windows)]
     {
         is_windows_admin().unwrap_or(false)
     }
-
     #[cfg(not(any(unix, windows)))]
     {
         false
@@ -462,7 +408,6 @@ fn has_raw_socket_privileges() -> bool {
 #[cfg(windows)]
 fn is_windows_admin() -> Option<bool> {
     use std::process::Command;
-
     let out = Command::new("powershell")
         .args([
             "-NoProfile",
@@ -473,11 +418,9 @@ fn is_windows_admin() -> Option<bool> {
         ])
         .output()
         .ok()?;
-
     if !out.status.success() {
         return None;
     }
-
     Some(
         String::from_utf8(out.stdout)
             .ok()?
