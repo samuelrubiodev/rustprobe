@@ -45,49 +45,46 @@ pub async fn run_syn_scan(
         return Ok(Vec::new());
     }
 
-    // ── Topology detection ────────────────────────────────────────────────────
+    // ── Timing (fully derived from TimingProfile) ─────────────────────────────
     //
-    // Whether all targets sit on the local network (RFC 1918 / loopback)
-    // determines the RTT estimate.  Local NICs respond in <5 ms; a WAN hop
-    // through a NAT + firewall can be 100–300 ms.  Every timeout we derive
-    // below is proportional to this estimate, so the scan is neither lazy on
-    // LAN nor impatient on the Internet.
+    // Local vs remote determines how long we must wait for replies.
+    // RFC1918/loopback → same-LAN VM, reply in <5 ms.
+    // Public IP         → WAN RTT 20–300 ms; use timing.timeout_ms as the
+    //                     worst-case reply deadline (that is what the user
+    //                     configured when choosing T1..T5).
     let all_local = ipv4_targets.iter().all(|ip| is_rfc1918(*ip));
 
-    // Conservative RTT estimate.
-    //   Local  → 5 ms  (covers any VM hypervisor jitter)
-    //   Remote → half of timing.timeout_ms, floor 50 ms
-    let rtt_ms: u64 = if all_local {
-        5
+    // How long to wait after the last SYN before the final drain.
+    // Local: cap at 200 ms (overkill for a hypervisor NIC).
+    // Remote: full timing.timeout_ms — any reply arriving later cannot be
+    //         captured regardless, so there is no point waiting longer.
+    let grace_ms: u64 = if all_local {
+        timing.timeout_ms.min(200)
     } else {
-        (timing.timeout_ms / 2).max(50)
+        timing.timeout_ms
     };
 
-    // How long to sleep after the LAST SYN before starting the final drain.
-    // 3× RTT gives even the slowest in-flight SYN-ACK time to arrive.
-    let grace_ms: u64 = rtt_ms.saturating_mul(3).max(if all_local { 50 } else { 300 });
+    // Quiet window for drains: stop waiting once silent for this long.
+    // Shorter than grace_ms so we exit quickly after the last reply.
+    let quiet_ms: u64 = (timing.timeout_ms / 3).clamp(30, 300);
 
-    // Quiet window: if no new hit arrives within this time the drain is done.
-    let quiet_ms: u64 = rtt_ms.max(30);
+    // Inter-pass drain cap: keep it tight so passes don't stall.
+    let pass_cap_ms: u64 = quiet_ms * 2;
 
-    // Hard cap for the inter-pass drain (prevents it stalling on a retry loop).
-    let pass_cap_ms: u64 = rtt_ms.saturating_mul(4).max(200);
+    // Final drain cap: generous — catches any late stragglers.
+    let final_cap_ms: u64 = grace_ms + quiet_ms * 3;
 
-    // Hard cap for the final drain.
-    let final_cap_ms: u64 = rtt_ms.saturating_mul(8).max(500);
-
-    // ── AIMD rate control ─────────────────────────────────────────────────────
+    // ── Wire-speed send with ENOBUFS back-off ────────────────────────────────
     //
-    // We pace sends using a deadline-per-packet model rather than burst+sleep.
-    // `current_pps` is the live send rate (packets / second).
-    //   On ENOBUFS (kernel TX queue full): halve it  (multiplicative decrease).
-    //   Every 512 clean sends: nudge it +5% toward target_pps              (additive increase).
+    // We send packets as fast as the kernel allows (zero sleep by default).
+    // `throttle_us` starts at 0 (unlimited).  When the kernel TX queue is
+    // full (ENOBUFS) we double the throttle (multiplicative back-off, same
+    // as TCP slow-start).  After each successful send we shave 2% off the
+    // throttle (linear recovery) until it returns to 0.
     //
-    //   This is exactly TCP AIMD: aggressive reaction to congestion, gentle
-    //   probe when things are going well.
-    let target_pps: u64 = timing.concurrency.max(1) as u64;
-    let mut current_pps: u64 = target_pps;
-    let mut good_streak: u64 = 0;
+    // This means:  no overhead on fast paths (LAN, well-provisioned VMs),
+    //              automatic graceful degradation on congested paths.
+    let mut throttle_us: u64 = 0;
 
     // ── Transport channel ─────────────────────────────────────────────────────
     let protocol = Layer4(Ipv4(IpNextHeaderProtocols::Tcp));
@@ -173,75 +170,55 @@ pub async fn run_syn_scan(
 
     // ── Send loop ─────────────────────────────────────────────────────────────
     //
-    // Deadline-based rate limiting: instead of sleep-after-N-packets we
-    // track exactly when the next packet should go out.  Sleeping only the
-    // delta between now and that deadline gives sub-millisecond pacing
-    // accuracy with no accumulation of drift across thousands of ports.
-    //
-    // Multiple passes (retries) ensure reliability: ports that got a dropped
-    // SYN on pass 1 are retried on pass 2, etc.
-    let num_passes = timing.retries.max(1) as usize + 1;
+    // `num_passes` = user's retry count + 1 initial pass.
+    // Multiple passes improve reliability on lossy paths: a SYN dropped in
+    // pass 1 gets a second chance in pass 2 without re-creating the channel.
+    let num_passes = timing.retries as usize + 1;
     let mut buf = [0u8; 24]; // 20-byte TCP base + 4-byte MSS option
     let mut open_set: HashSet<(Ipv4Addr, u16)> = HashSet::new();
     let mut hits_reported: usize = 0;
-    let mut next_send = Instant::now();
 
-    for pass in 0..num_passes {
+    for _pass in 0..num_passes {
         for (idx, &dst_ip) in ipv4_targets.iter().enumerate() {
             let Some(src_ip) = src_ips[idx] else { continue; };
 
             for &dst_port in ports {
                 build_syn_packet(src_ip, dst_ip, src_port, dst_port, &mut buf);
 
-                // Wait until the rate-limit deadline before sending.
-                let now = Instant::now();
-                if now < next_send {
-                    std::thread::sleep(next_send - now);
+                // Throttle only when ENOBUFS has forced us to slow down.
+                // When throttle_us == 0 (the common case) this branch is free.
+                if throttle_us > 0 {
+                    std::thread::sleep(Duration::from_micros(throttle_us));
+                    // Linear recovery: shed 2% of throttle per packet sent.
+                    throttle_us = throttle_us.saturating_sub(throttle_us / 50 + 1);
                 }
 
-                // Attempt to send; back off with AIMD on kernel congestion.
+                // Send; back off on ENOBUFS (kernel TX queue full).
                 let mut retries_left = 8u8;
                 loop {
                     let pkt = TcpPacket::new(&buf).expect("buffer TCP inválido");
                     match tx.send_to(pkt, IpAddr::V4(dst_ip)) {
-                        Ok(_) => {
-                            good_streak += 1;
-                            // Additive increase: every 512 clean sends nudge
-                            // current_pps 5% closer to the original target.
-                            if good_streak % 512 == 0 && current_pps < target_pps {
-                                current_pps =
-                                    (current_pps + (target_pps / 20).max(1)).min(target_pps);
-                            }
-                            break;
-                        }
+                        Ok(_) => break,
                         Err(e)
                             if e.raw_os_error() == Some(enobufs_code())
                                 && retries_left > 0 =>
                         {
                             retries_left -= 1;
-                            good_streak = 0;
-                            // Multiplicative decrease: halve the rate, floor 50 pps.
-                            current_pps = (current_pps / 2).max(50);
-                            // Sleep one inter-packet interval at the new reduced
-                            // rate to let the kernel TX queue drain.
-                            std::thread::sleep(Duration::from_micros(
-                                (1_000_000 / current_pps).min(20_000),
-                            ));
+                            // Multiplicative back-off: double throttle (floor 1 ms,
+                            // cap 50 ms = 20 pps).  Let the kernel TX queue drain
+                            // for exactly that long before retrying.
+                            throttle_us = (throttle_us.max(1_000) * 2).min(50_000);
+                            std::thread::sleep(Duration::from_micros(throttle_us));
                         }
                         Err(_) => break, // unrecoverable; skip this port
                     }
                 }
-
-                // Advance the deadline by one inter-packet interval so the
-                // next iteration naturally waits the right amount.
-                next_send = Instant::now()
-                    + Duration::from_micros(1_000_000 / current_pps.max(1));
             }
         }
 
-        // Drain replies accumulated during this pass before the next wave.
-        // On the final pass the grace sleep below will catch stragglers.
-        let _ = pass; // suppress unused-variable warning in release mode
+        // Drain replies already sitting in the channel before the next SYN wave.
+        // Keep the window tight (pass_cap_ms) so passes don't stall waiting
+        // for slow replies — the grace sleep below handles those.
         drain_channel(
             &hit_rx,
             &mut open_set,
