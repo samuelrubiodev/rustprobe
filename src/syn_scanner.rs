@@ -9,8 +9,7 @@ use pnet::transport::{
 };
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{sleep, Duration};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ── Tuning constants ────────────────────────────────────────────────────────
 
@@ -35,6 +34,15 @@ const DRAIN_MAX_MS: u64 = 2_000;
 
 /// Max back-off retries when the kernel returns ENOBUFS.
 const ENOBUFS_RETRIES: u8 = 5;
+
+/// Mandatory sleep AFTER the sender loop finishes and BEFORE starting the
+/// final adaptive drain.  External SYN-ACKs travelling through NAT can take
+/// 1–2 s; without this floor we close the receiver before they arrive.
+const FINAL_GRACE_MS: u64 = 3_000;
+
+/// Quiet-window for the FINAL drain (after the grace period).  1 s lets
+/// bursty late replies all land before we declare the scan complete.
+const FINAL_QUIET_MS: u64 = 1_000;
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
@@ -78,9 +86,22 @@ pub async fn run_syn_scan(
     // ── 2. Fixed source port ────────────────────────────────────────────────
     //
     // A stable, non-zero source port is MANDATORY for external scans:
-    // the router/NAT must see the same sport in every SYN so it can route
-    // the SYN-ACK replies back to us.
-    let src_port: u16 = 40_000 + (std::process::id() % 20_000) as u16;
+    // every SYN in this session carries the SAME sport so the NAT table
+    // keeps a single state entry and routes ALL SYN-ACK replies back to us.
+    //
+    // We derive it once by XOR-mixing the PID with subsecond nanos so that
+    // concurrent rustprobe instances rarely collide and the port is
+    // unpredictable (no `rand` dependency required).
+    let src_port: u16 = {
+        let pid   = std::process::id() as u64;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0xDEAD_BEEF);
+        // Keep the port in the unprivileged ephemeral range [32 768, 60 999].
+        let mixed = pid ^ nanos ^ (pid.wrapping_shl(13)) ^ (nanos.wrapping_shr(7));
+        32_768_u16 + (mixed % 28_232) as u16
+    };
 
     // ── 3. Spin up the radar BEFORE the first packet leaves ─────────────────
     //
@@ -170,10 +191,13 @@ pub async fn run_syn_scan(
 
                 sent_count += 1;
 
-                // Pacing: yield after every BURST_SIZE packets so the NIC
-                // queue never fills up enough to trigger ENOBUFS silently.
+                // Pacing: after every burst, hand the NIC hardware time to
+                // drain its TX queue.  std::thread::sleep is intentional here:
+                // the entire send loop is synchronous (send_to blocks), so a
+                // tokio async yield would not add any benefit and could be
+                // less precise on short durations.
                 if sent_count % BURST_SIZE == 0 {
-                    sleep(Duration::from_millis(BURST_PAUSE_MS)).await;
+                    std::thread::sleep(Duration::from_millis(BURST_PAUSE_MS));
                 }
             }
         }
@@ -187,11 +211,23 @@ pub async fn run_syn_scan(
         }
     }
 
-    // ── 6. Adaptive drain window ────────────────────────────────────────────
+    // ── 6. Mandatory grace period + final adaptive drain ───────────────────
     //
-    // Collect hits until the flow goes quiet for DRAIN_QUIET_MS or the hard
-    // cap DRAIN_MAX_MS is reached.  Dropping hit_rx signals the radar thread.
-    drain_adaptive(&hit_rx, &mut open_set, DRAIN_QUIET_MS, DRAIN_MAX_MS, reporter, &mut hits_reported);
+    // WHY the explicit sleep:
+    //   Remote SYN-ACKs travelling through NAT can arrive 500 ms – 2+ s after
+    //   the last SYN is sent.  Without this floor the adaptive drain's quiet
+    //   window (DRAIN_QUIET_MS = 200 ms) fires before ANY external reply lands,
+    //   producing 0 open ports on every remote target.
+    //
+    //   The sleep runs on the OS thread (std::thread::sleep) so it is precise
+    //   even under heavy tokio executor load.  During these 3 s the radar
+    //   thread continues to receive and enqueue SYN-ACKs into hit_tx.
+    std::thread::sleep(Duration::from_millis(FINAL_GRACE_MS));
+
+    // Now drain whatever accumulated in the channel, plus any stragglers that
+    // still trickle in.  FINAL_QUIET_MS (1 s) is wide enough to catch bursts
+    // of late replies; DRAIN_MAX_MS is the absolute hard cap.
+    drain_adaptive(&hit_rx, &mut open_set, FINAL_QUIET_MS, DRAIN_MAX_MS, reporter, &mut hits_reported);
     // hit_rx dropped at end of scope → channel closed → radar thread exits.
 
     // ── 7. Build report ─────────────────────────────────────────────────────
