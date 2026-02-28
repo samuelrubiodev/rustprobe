@@ -10,7 +10,7 @@ mod wasm;
 
 use crate::cli::{parse_cli, parse_ports, parse_timing, should_show_closed_in_live};
 use crate::config::{ensure_default_scripts_dir, has_wasm_files};
-use crate::models::TimingProfile;
+use crate::models::{ScriptResult, TimingProfile};
 use crate::network::{clamp_concurrency, resolve_targets, scan_targets};
 use crate::report::{paint, print_report, supports_color, write_report_file, LiveReporter};
 use crate::syn_scanner::run_syn_scan;
@@ -119,7 +119,62 @@ async fn run() -> Result<()> {
 
     let reporter = LiveReporter::new(colors_enabled, show_closed_in_live);
     let reports = if cli.syn {
-        run_syn_scan(&targets, &ports, timing, &reporter).await?
+        let mut syn_reports = run_syn_scan(&targets, &ports, timing, &reporter).await?;
+
+        // ── Run Wasm scripts on open ports (same pipeline as TCP connect mode) ──
+        if let Some(engine) = &wasm_engine {
+            let script_semaphore =
+                Arc::new(tokio::sync::Semaphore::new(4));
+            let mut script_jobs: tokio::task::JoinSet<(usize, Vec<ScriptResult>)> =
+                tokio::task::JoinSet::new();
+
+            for (idx, report) in syn_reports.iter().enumerate() {
+                let permit = script_semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("script semaphore closed");
+                let engine = Arc::clone(engine);
+                let reporter_clone = reporter.clone();
+                let ip = report.ip;
+                let port = report.port;
+                let pb = reporter.add_scanning_spinner(ip, port);
+                let hostname = scan_hostname.clone();
+                // detection_index is already past next_index in the ordered
+                // printer (on_open advanced it during drain), so finish_spinner
+                // clears the spinner without re-printing the port line.
+                let detection_index = idx + 1;
+
+                script_jobs.spawn(async move {
+                    let results = match tokio::task::spawn_blocking(move || {
+                        engine.run_scripts(ip, port, hostname.as_deref())
+                    })
+                    .await
+                    {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => vec![ScriptResult {
+                            script: "wasm-engine".into(),
+                            status: "error".into(),
+                            details: format!("{e:#}"),
+                        }],
+                        Err(e) => vec![ScriptResult {
+                            script: "wasm-worker".into(),
+                            status: "error".into(),
+                            details: format!("{e}"),
+                        }],
+                    };
+                    reporter_clone.finish_spinner(pb, detection_index, ip, port, &results);
+                    drop(permit);
+                    (idx, results)
+                });
+            }
+
+            while let Some(Ok((idx, results))) = script_jobs.join_next().await {
+                syn_reports[idx].scripts = results;
+            }
+        }
+
+        syn_reports
     } else {
         scan_targets(
             &targets,
