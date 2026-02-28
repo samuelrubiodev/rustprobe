@@ -17,34 +17,8 @@ use tokio::time::sleep;
 /// Kernel RX socket buffer.  64 KB overflows on any real scan; 4 MB is safe.
 const RX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-/// Number of SYN packets to send before yielding to the OS network stack.
-/// 32 is conservative – prevents ENOBUFS on VMs with limited NIC queues.
-const BURST_SIZE: usize = 32;
-
-/// Pause between bursts (ms).  4 ms lets the NIC queue drain without making
-/// an 8 000-port scan noticeably slower (~1 s overhead total).
-const BURST_PAUSE_MS: u64 = 4;
-
-/// Quiet-window for inter-pass drains.  400 ms catches even lightly-loaded
-/// remote services that take a few hundred ms to respond.
-const DRAIN_QUIET_MS: u64 = 400;
-
-/// Hard cap for EACH inter-pass drain.  1 500 ms is enough time to drain
-/// all pending SYN-ACKs from a full 8 000-port pass on any network.
-const DRAIN_PASS_MAX_MS: u64 = 1_500;
-
-/// Hard cap for the FINAL drain (after the grace sleep).
-const DRAIN_MAX_MS: u64 = 2_000;
-
 /// Max back-off retries when the kernel returns ENOBUFS.
 const ENOBUFS_RETRIES: u8 = 5;
-
-/// Mandatory async sleep AFTER all passes and their drains, BEFORE the final
-/// drain.  Gives in-flight SYN-ACKs from remote targets time to arrive.
-const FINAL_GRACE_MS: u64 = 3_000;
-
-/// Quiet-window for the FINAL drain (after the grace period).
-const FINAL_QUIET_MS: u64 = 1_000;
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
@@ -76,6 +50,19 @@ pub async fn run_syn_scan(
     if ports.is_empty() {
         return Ok(Vec::new());
     }
+
+    // ── 0. Dynamic timing parameters ────────────────────────────────────────
+    //
+    // All tuning constants are derived from the user-supplied TimingProfile so
+    // that -T1/-T3 are conservative while -T4/-T5 are as fast as the link
+    // and remote stack allow.
+    let burst_size       = timing.concurrency.clamp(64, 1024) as usize;
+    let burst_pause_ms   = if timing.concurrency > 1000 { 1u64 } else { 3u64 };
+    let final_grace_ms   = timing.timeout_ms.max(300);
+    let final_quiet_ms   = (timing.timeout_ms / 2).clamp(100, 500);
+    let drain_quiet_ms   = (timing.timeout_ms / 3).clamp(50, 200);
+    let drain_pass_max_ms = timing.timeout_ms.max(500);
+    let drain_max_ms     = timing.timeout_ms.saturating_mul(2).max(1000);
 
     // ── 1. Transport channel ────────────────────────────────────────────────
     //
@@ -245,8 +232,8 @@ pub async fn run_syn_scan(
                 // Pacing: after every burst, hand the NIC hardware time to
                 // drain its TX queue.  std::thread::sleep is intentional here:
                 // the entire send loop is synchronous (send_to blocks).
-                if pass_sent % BURST_SIZE == 0 {
-                    std::thread::sleep(Duration::from_millis(BURST_PAUSE_MS));
+                if pass_sent % burst_size == 0 {
+                    std::thread::sleep(Duration::from_millis(burst_pause_ms));
                 }
             }
         }
@@ -265,8 +252,8 @@ pub async fn run_syn_scan(
         drain_adaptive(
             &hit_rx,
             &mut open_set,
-            DRAIN_QUIET_MS,
-            DRAIN_PASS_MAX_MS,
+            drain_quiet_ms,
+            drain_pass_max_ms,
             reporter,
             &mut hits_reported,
         );
@@ -291,12 +278,12 @@ pub async fn run_syn_scan(
     //   We use tokio::time::sleep (async await) so the tokio worker thread is
     //   freed during the wait – the radar thread continues receiving and
     //   enqueuing SYN-ACKs into hit_tx the whole time.
-    sleep(Duration::from_millis(FINAL_GRACE_MS)).await;
+    sleep(Duration::from_millis(final_grace_ms)).await;
 
     // Now drain whatever accumulated in the channel, plus any stragglers that
     // still trickle in.  FINAL_QUIET_MS (1 s) is wide enough to catch bursts
     // of late replies; DRAIN_MAX_MS is the absolute hard cap.
-    drain_adaptive(&hit_rx, &mut open_set, FINAL_QUIET_MS, DRAIN_MAX_MS, reporter, &mut hits_reported);
+    drain_adaptive(&hit_rx, &mut open_set, final_quiet_ms, drain_max_ms, reporter, &mut hits_reported);
     // hit_rx dropped at end of scope → channel closed → radar thread exits.
 
     // ── 7. Build report ─────────────────────────────────────────────────────
