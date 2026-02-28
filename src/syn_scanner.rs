@@ -56,8 +56,11 @@ pub async fn run_syn_scan(
     // All tuning constants are derived from the user-supplied TimingProfile so
     // that -T1/-T3 are conservative while -T4/-T5 are as fast as the link
     // and remote stack allow.
-    let burst_size       = timing.concurrency.max(64) as usize;
-    let burst_pause_ms   = if timing.concurrency > 1000 { 1u64 } else { 3u64 };
+    // burst_size and burst_pause_ms are mutable so ENOBUFS can apply
+    // AIMD-style back-pressure: halve the burst, double the pause.
+    // Initial cap of 512 keeps the NIC TX queue from flooding even on -T5.
+    let mut burst_size     = timing.concurrency.clamp(32, 512) as usize;
+    let mut burst_pause_ms = if timing.concurrency > 500 { 2u64 } else { 5u64 };
     let final_grace_ms   = timing.timeout_ms.max(300);
     let final_quiet_ms   = (timing.timeout_ms / 2).clamp(100, 500);
     let drain_quiet_ms   = (timing.timeout_ms / 3).clamp(50, 200);
@@ -220,8 +223,13 @@ pub async fn run_syn_scan(
                         {
                             enobufs_left -= 1;
                             enobufs_total += 1;
-                            // Give the kernel 10 ms to fully drain its send queue.
-                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            // AIMD back-pressure: halve burst, double pause (capped).
+                            // This converges to a stable send rate that the kernel
+                            // can sustain without overflowing the NIC TX queue.
+                            burst_size = (burst_size / 2).max(32);
+                            burst_pause_ms = (burst_pause_ms * 2).min(50);
+                            // Give the kernel time to drain before retrying.
+                            std::thread::sleep(std::time::Duration::from_millis(burst_pause_ms));
                         }
                         Err(_) => break, // unrecoverable – skip port
                     }
@@ -262,8 +270,9 @@ pub async fn run_syn_scan(
     if enobufs_total > 0 {
         eprintln!(
             "[SYN] WARN: ENOBUFS se repitió {} veces durante el escaneo. \
-             Considera reducir BURST_SIZE o aumentar BURST_PAUSE_MS.",
-            enobufs_total
+             El control de congestión adaptativo (AIMD) ajustó el ritmo de envío automáticamente. \
+             Burst final: {} paquetes / {} ms pausa.",
+            enobufs_total, burst_size, burst_pause_ms
         );
     }
 
