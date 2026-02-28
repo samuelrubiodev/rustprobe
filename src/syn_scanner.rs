@@ -56,7 +56,7 @@ pub async fn run_syn_scan(
     // All tuning constants are derived from the user-supplied TimingProfile so
     // that -T1/-T3 are conservative while -T4/-T5 are as fast as the link
     // and remote stack allow.
-    let burst_size       = timing.concurrency.clamp(64, 1024) as usize;
+    let burst_size       = timing.concurrency.max(64) as usize;
     let burst_pause_ms   = if timing.concurrency > 1000 { 1u64 } else { 3u64 };
     let final_grace_ms   = timing.timeout_ms.max(300);
     let final_quiet_ms   = (timing.timeout_ms / 2).clamp(100, 500);
@@ -184,7 +184,7 @@ pub async fn run_syn_scan(
     // Retry strategy: full passes instead of N consecutive retries per port.
     // Spreading retries evenly reduces burst pressure and improves coverage.
     let max_retries = timing.retries.max(1) as usize;
-    let mut buf = [0u8; 20]; // reusable 20-byte packet buffer
+    let mut buf = [0u8; 24]; // reusable 24-byte packet buffer (20 base + 4 MSS option)
     let mut enobufs_total: u32 = 0;
 
     // open_set is shared across passes and the inter-pass mini-drain.
@@ -220,8 +220,8 @@ pub async fn run_syn_scan(
                         {
                             enobufs_left -= 1;
                             enobufs_total += 1;
-                            // Give the kernel 5 ms to drain its send queue.
-                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            // Give the kernel 10 ms to fully drain its send queue.
+                            std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                         Err(_) => break, // unrecoverable – skip port
                     }
@@ -386,13 +386,16 @@ fn get_source_ip(target: Ipv4Addr) -> Option<Ipv4Addr> {
 /// - `src_port` is fixed for the whole scan so NAT returns work.
 /// - `window` of 64 240 matches the Linux kernel default – looks normal to
 ///   stateful firewalls.  A value of 1 024 is suspicious and often filtered.
-/// - `data_offset` 5 → 20-byte header, no options → fits exactly in `buf`.
+/// - `data_offset` 6 → 24-byte header (MSS option included) → fits exactly in `buf`.
+/// - MSS 1460 is the standard Ethernet MTU-derived value; its presence prevents
+///   strict WAFs from dropping the SYN as a scanner fingerprint (real OSes
+///   always advertise MSS in the initial SYN).
 fn build_syn_packet(
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
     src_port: u16,
     dst_port: u16,
-    buf: &mut [u8; 20],
+    buf: &mut [u8; 24],
 ) {
     // Zero out on every call so reusing the buffer is safe.
     buf.fill(0);
@@ -405,16 +408,21 @@ fn build_syn_packet(
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
 
+    // Standard MSS for Ethernet (MTU 1500 − 20 IP − 20 TCP = 1460).
+    // Including this option is mandatory for WAF evasion: any stack that
+    // omits MSS in a SYN is trivially identified as a scanner.
+    let mss = TcpOption::mss(1460);
+
     pkt.set_source(src_port);
     pkt.set_destination(dst_port);
     pkt.set_sequence(seq);
     pkt.set_acknowledgement(0);
-    pkt.set_data_offset(5); // 5 × 4 = 20 bytes, no TCP options
+    pkt.set_data_offset(6); // 6 × 4 = 24 bytes (20 base + 4 MSS option)
     pkt.set_reserved(0);
     pkt.set_flags(TcpFlags::SYN);
     pkt.set_window(64_240); // realistic Linux default
     pkt.set_urgent_ptr(0);
-    pkt.set_options(&[] as &[TcpOption]);
+    pkt.set_options(&[mss]);
     pkt.set_checksum(0); // MUST be zero before computing the real checksum
 
     // ipv4_checksum uses a TCP pseudo-header (src/dst IP, proto, TCP length).
