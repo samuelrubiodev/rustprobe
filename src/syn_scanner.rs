@@ -10,6 +10,7 @@ use pnet::transport::{
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::sleep;
 
 // ── Tuning constants ────────────────────────────────────────────────────────
 
@@ -43,6 +44,63 @@ const FINAL_GRACE_MS: u64 = 3_000;
 /// Quiet-window for the FINAL drain (after the grace period).  1 s lets
 /// bursty late replies all land before we declare the scan complete.
 const FINAL_QUIET_MS: u64 = 1_000;
+
+// ── Linux: suppress kernel RST via iptables ─────────────────────────────────
+//
+// Root cause: when  a SYN-ACK arrives for a SYN we sent via raw socket, the
+// Linux kernel has NO matching TCP state entry and IMMEDIATELY sends RST back.
+// That RST can reach a stateful remote firewall BEFORE our program reads the
+// SYN-ACK from the raw socket, causing the firewall to block further SYNs
+// from our IP – which is exactly why `apps.openportalhub.org` returns 0 ports.
+//
+// Fix: insert an iptables OUTPUT DROP rule that prevents the kernel from
+// sending RSTs on our chosen source port for the duration of the scan.
+// The rule is removed on Drop, even if the process panics.
+
+#[cfg(unix)]
+struct IptablesRstGuard {
+    sport: u16,
+    installed: bool,
+}
+
+#[cfg(unix)]
+impl IptablesRstGuard {
+    fn install(sport: u16) -> Self {
+        let installed = std::process::Command::new("iptables")
+            .args([
+                "-I", "OUTPUT",
+                "-p", "tcp",
+                "--sport", &sport.to_string(),
+                "--tcp-flags", "RST", "RST",
+                "-j", "DROP",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        Self { sport, installed }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IptablesRstGuard {
+    fn drop(&mut self) {
+        if self.installed {
+            let _ = std::process::Command::new("iptables")
+                .args([
+                    "-D", "OUTPUT",
+                    "-p", "tcp",
+                    "--sport", &self.sport.to_string(),
+                    "--tcp-flags", "RST", "RST",
+                    "-j", "DROP",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
@@ -103,6 +161,20 @@ pub async fn run_syn_scan(
         32_768_u16 + (mixed % 28_232) as u16
     };
 
+    // ── 2b. Suppress kernel RST on Linux ────────────────────────────────────
+    //
+    // The Linux kernel automatically sends RST for any inbound SYN-ACK that
+    // has no matching entry in the TCP connection table (because we bypassed
+    // the kernel's TCP stack by using raw sockets).  That RST races with our
+    // detection:
+    //   SYN (us, raw) → remote port open → SYN-ACK → kernel sends RST
+    //   → remote firewall sees RST → drops subsequent SYNs from our IP
+    //
+    // We suppress it by dropping RSTs on our source port for the duration of
+    // the scan.  The RAII guard removes the rule even on panic/early return.
+    #[cfg(unix)]
+    let _rst_guard = IptablesRstGuard::install(src_port);
+
     // ── 3. Spin up the radar BEFORE the first packet leaves ─────────────────
     //
     // pnet 0.34's next() is a blocking call with no built-in timeout.
@@ -137,8 +209,16 @@ pub async fn run_syn_scan(
                         }
                     }
                 }
-                // Socket error (e.g. EBADF on shutdown) – exit.
-                Err(_) => break,
+                // Transient errors (EINTR, EAGAIN) must NOT kill the thread.
+                // Only exit on EBADF / other fatal errors that indicate the
+                // socket itself is gone.
+                Err(e) => {
+                    use std::io::ErrorKind::*;
+                    match e.kind() {
+                        Interrupted | WouldBlock | TimedOut => continue, // retry
+                        _ => break, // fatal: socket closed or unrecoverable
+                    }
+                }
             }
         }
     });
@@ -219,10 +299,10 @@ pub async fn run_syn_scan(
     //   window (DRAIN_QUIET_MS = 200 ms) fires before ANY external reply lands,
     //   producing 0 open ports on every remote target.
     //
-    //   The sleep runs on the OS thread (std::thread::sleep) so it is precise
-    //   even under heavy tokio executor load.  During these 3 s the radar
-    //   thread continues to receive and enqueue SYN-ACKs into hit_tx.
-    std::thread::sleep(Duration::from_millis(FINAL_GRACE_MS));
+    //   We use tokio::time::sleep (async await) so the tokio worker thread is
+    //   freed during the wait – the radar thread continues receiving and
+    //   enqueuing SYN-ACKs into hit_tx the whole time.
+    sleep(Duration::from_millis(FINAL_GRACE_MS)).await;
 
     // Now drain whatever accumulated in the channel, plus any stragglers that
     // still trickle in.  FINAL_QUIET_MS (1 s) is wide enough to catch bursts
